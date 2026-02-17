@@ -1,0 +1,1350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智能图片网格裁切工具</title>
+    <!-- 引入 Tailwind CSS 进行样式设计 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 引入 JSZip 用于打包下载 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <!-- 引入 FileSaver 用于保存文件 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+    <!-- 引入 OpenCV.js（用于导入后自动去除角落水印） -->
+    <script>
+        window.__cvState = { status: 'loading', error: '' };
+        window.__cvReadyResolver = null;
+        window.__cvReadyPromise = new Promise(resolve => {
+            window.__cvReadyResolver = resolve;
+        });
+
+        function markCvState(status, errorMessage = '') {
+            if (window.__cvState.status === 'ready' || window.__cvState.status === 'failed') return;
+            window.__cvState.status = status;
+            window.__cvState.error = errorMessage;
+            if (window.__cvReadyResolver) {
+                window.__cvReadyResolver(status === 'ready');
+                window.__cvReadyResolver = null;
+            }
+        }
+
+        function onOpenCvScriptLoad() {
+            if (!window.cv) {
+                markCvState('failed', 'OpenCV 未注入到页面');
+                return;
+            }
+            if (typeof window.cv.Mat === 'function') {
+                markCvState('ready');
+                return;
+            }
+            const previous = window.cv.onRuntimeInitialized;
+            window.cv.onRuntimeInitialized = function() {
+                if (typeof previous === 'function') previous();
+                markCvState('ready');
+            };
+        }
+
+        function onOpenCvScriptError() {
+            markCvState('failed', 'OpenCV 脚本加载失败');
+        }
+
+        window.__waitForCv = function(timeoutMs = 7000) {
+            if (window.cv && typeof window.cv.Mat === 'function') {
+                window.__cvState.status = 'ready';
+                return Promise.resolve(true);
+            }
+            if (window.__cvState.status === 'failed') return Promise.resolve(false);
+            const timeoutPromise = new Promise(resolve => setTimeout(() => resolve(false), timeoutMs));
+            return Promise.race([window.__cvReadyPromise, timeoutPromise]);
+        };
+    </script>
+    <script async src="https://docs.opencv.org/4.10.0/opencv.js" onload="onOpenCvScriptLoad()" onerror="onOpenCvScriptError()"></script>
+    
+    <style>
+        body {
+            font-family: 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background-color: #1a1a1a;
+            color: #e5e5e5;
+        }
+        
+        /* 自定义滚动条 */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #2d2d2d; 
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #555; 
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #777; 
+        }
+
+        /* 棋盘格背景 */
+        .checkerboard-bg {
+            background-color: #2d2d2d;
+            background-image: 
+                linear-gradient(45deg, #333 25%, transparent 25%), 
+                linear-gradient(-45deg, #333 25%, transparent 25%), 
+                linear-gradient(45deg, transparent 75%, #333 75%), 
+                linear-gradient(-45deg, transparent 75%, #333 75%);
+            background-size: 20px 20px;
+            background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+        }
+
+        /* 画布容器 */
+        #canvas-container {
+            position: relative;
+            overflow: hidden; 
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background-color: transparent;
+        }
+
+        canvas {
+            display: block;
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5); 
+        }
+
+        /* 结果画廊 */
+        .result-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+            gap: 1rem;
+            padding: 1rem;
+        }
+
+        .result-item {
+            background: #2d2d2d;
+            padding: 0.5rem;
+            border-radius: 0.5rem;
+            text-align: center;
+            transition: transform 0.2s;
+            border: 1px solid #444;
+        }
+
+        .result-item:hover {
+            transform: translateY(-2px);
+            border-color: #3b82f6;
+        }
+
+        .result-img {
+            max-width: 100%;
+            height: auto;
+            margin-bottom: 0.5rem;
+            background-image: linear-gradient(45deg, #ccc 25%, transparent 25%), linear-gradient(-45deg, #ccc 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #ccc 75%), linear-gradient(-45deg, transparent 75%, #ccc 75%);
+            background-size: 10px 10px;
+            background-color: white;
+        }
+
+        /* 输入框样式 */
+        input[type="number"], input[type="text"], select {
+            background-color: #333;
+            border: 1px solid #555;
+            color: white;
+            padding: 0.25rem 0.5rem;
+            border-radius: 0.25rem;
+            width: 100%;
+        }
+        input[type="number"]:focus, input[type="text"]:focus, select:focus {
+            outline: none;
+            border-color: #3b82f6;
+        }
+    </style>
+</head>
+<body class="h-screen flex flex-col">
+
+    <!-- 顶部导航 -->
+    <header class="bg-gray-800 border-b border-gray-700 p-4 flex justify-between items-center shadow-lg z-10">
+        <div class="flex items-center gap-3">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-blue-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+            </svg>
+            <h1 class="text-xl font-bold tracking-wide">GridSlicer <span class="text-sm font-normal text-gray-400 ml-2">图片网格裁切工具</span></h1>
+        </div>
+        <div>
+            <a href="#" onclick="loadDemoImage()" class="text-sm text-blue-400 hover:text-blue-300 underline mr-4">加载示例图片</a>
+            <button onclick="document.getElementById('fileInput').click()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg font-medium transition flex items-center gap-2">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                </svg>
+                选择图片
+            </button>
+            <input type="file" id="fileInput" accept="image/*" class="hidden">
+        </div>
+    </header>
+
+    <!-- 主体内容 -->
+    <main class="flex-1 flex overflow-hidden">
+        
+        <!-- 左侧控制面板 -->
+        <aside class="w-80 bg-gray-900 border-r border-gray-700 p-5 overflow-y-auto flex flex-col gap-6 shadow-xl z-10">
+
+            <!-- 0. 导入预处理 -->
+            <div class="space-y-3">
+                <h2 class="text-lg font-semibold text-blue-400 border-b border-gray-700 pb-2">0. 导入预处理</h2>
+                <label class="flex items-start gap-2 text-sm text-gray-300">
+                    <input type="checkbox" id="autoWatermarkToggle" checked class="mt-1 accent-blue-500">
+                    <span>导入时自动尝试去除 <span class="text-blue-300">Nano Banana</span> 水印</span>
+                </label>
+                <div class="grid grid-cols-2 gap-2">
+                    <button id="rerunCleanupBtn" class="bg-gray-700 hover:bg-gray-600 text-xs py-2 rounded disabled:opacity-50 disabled:cursor-not-allowed" disabled>重新去水印</button>
+                    <button id="restoreOriginalBtn" class="bg-gray-700 hover:bg-gray-600 text-xs py-2 rounded disabled:opacity-50 disabled:cursor-not-allowed" disabled>恢复原图</button>
+                </div>
+                <div id="watermarkStatus" class="text-xs text-gray-400 bg-gray-800 p-2 rounded leading-relaxed">
+                    状态：等待导入图片
+                </div>
+                <div class="text-[11px] text-gray-500">
+                    仅处理你有权编辑的图片；检测置信度低时会启用右下角修复兜底。
+                </div>
+            </div>
+            
+            <!-- 1. 网格设置 -->
+            <div class="space-y-4">
+                <h2 class="text-lg font-semibold text-blue-400 border-b border-gray-700 pb-2">1. 网格设置</h2>
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1">行数 (Rows)</label>
+                        <input type="number" id="rowsInput" value="2" min="1" class="text-center">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1">列数 (Cols)</label>
+                        <input type="number" id="colsInput" value="5" min="1" class="text-center">
+                    </div>
+                </div>
+                <div class="text-xs text-gray-500 bg-gray-800 p-2 rounded">
+                    提示：拖拽<span class="text-yellow-400">矩形</span>移动，拖拽<span class="text-yellow-400">边角</span>缩放。
+                </div>
+            </div>
+
+            <!-- 2. 比例锁定 (新增) -->
+            <div class="space-y-4">
+                <h2 class="text-lg font-semibold text-blue-400 border-b border-gray-700 pb-2">2. 单格比例锁定</h2>
+                
+                <select id="aspectSelect" class="w-full text-sm">
+                    <option value="free">自由调整 (Free)</option>
+                    <option value="1">1:1 (正方形)</option>
+                    <option value="1.3333">4:3</option>
+                    <option value="0.75">3:4</option>
+                    <option value="1.7778">16:9</option>
+                    <option value="0.5625">9:16</option>
+                    <option value="custom">自定义 (Custom)</option>
+                </select>
+
+                <div id="customRatioBox" class="hidden grid-cols-[1fr_auto_1fr] gap-2 items-center">
+                    <input type="number" id="customW" value="2" class="text-center" placeholder="W">
+                    <span class="text-gray-400 font-bold">:</span>
+                    <input type="number" id="customH" value="1" class="text-center" placeholder="H">
+                </div>
+                
+                <div class="text-xs text-gray-500">
+                    * 锁定的是<span class="text-blue-400">单个格子</span>的宽高比
+                </div>
+            </div>
+
+            <!-- 3. 精确位置 -->
+            <div class="space-y-4">
+                <h2 class="text-lg font-semibold text-blue-400 border-b border-gray-700 pb-2">3. 精确位置 (px)</h2>
+                
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1">起始 X</label>
+                        <input type="number" id="xInput" value="0">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1">起始 Y</label>
+                        <input type="number" id="yInput" value="0">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1">总宽度</label>
+                        <input type="number" id="wInput" value="0">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1">总高度</label>
+                        <input type="number" id="hInput" value="0">
+                    </div>
+                </div>
+                <div class="flex gap-2">
+                     <button onclick="resetCropBox()" class="flex-1 bg-gray-700 hover:bg-gray-600 text-xs py-2 rounded">全图</button>
+                     <button onclick="centerCropBox()" class="flex-1 bg-gray-700 hover:bg-gray-600 text-xs py-2 rounded">居中</button>
+                </div>
+            </div>
+
+            <!-- 4. 导出 -->
+            <div class="space-y-4">
+                <h2 class="text-lg font-semibold text-blue-400 border-b border-gray-700 pb-2">4. 导出</h2>
+                
+                <div>
+                    <label class="block text-xs text-gray-400 mb-1">文件名前缀</label>
+                    <input type="text" id="prefixInput" value="slice" placeholder="例如: icon">
+                </div>
+                
+                <button onclick="generateSlices()" class="w-full bg-green-600 hover:bg-green-700 text-white py-3 rounded-lg font-bold shadow-lg transform transition active:scale-95 flex justify-center items-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.121 14.121L19 19m-7-7l7-7m-7 7l-2.879 2.879M12 12L9.121 9.121m0 5.758a3 3 0 10-4.243 4.243 3 3 0 004.243-4.243zm0 0L12 12m0 0h7.5" />
+                    </svg>
+                    开始裁切
+                </button>
+            </div>
+        </aside>
+
+        <!-- 右侧工作区 -->
+        <div class="flex-1 flex flex-col min-w-0 bg-gray-800">
+            <!-- 画布区域 -->
+            <div class="flex-1 relative p-4 checkerboard-bg flex items-center justify-center overflow-hidden">
+                <div id="canvas-container">
+                    <canvas id="editorCanvas"></canvas>
+                </div>
+                <div id="empty-state" class="absolute text-center pointer-events-none">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-20 w-20 mx-auto text-gray-600 mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                    </svg>
+                    <p class="text-xl text-gray-400 font-medium">请上传图片开始操作</p>
+                </div>
+            </div>
+
+            <!-- 结果预览区 -->
+            <div id="result-panel" class="h-0 transition-all duration-300 bg-gray-900 border-t border-gray-700 flex flex-col">
+                <div class="p-3 bg-gray-800 border-b border-gray-700 flex justify-between items-center sticky top-0 z-20">
+                    <h3 class="font-bold flex items-center gap-2">
+                        <span class="w-2 h-6 bg-green-500 rounded-full"></span>
+                        裁切结果预览 (<span id="count-display">0</span>)
+                    </h3>
+                    <div class="flex gap-2">
+                        <button onclick="closeResults()" class="text-gray-400 hover:text-white px-3 py-1">关闭</button>
+                        <button onclick="downloadZip()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-1.5 rounded text-sm font-medium flex items-center gap-2">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4-4m0 0l-4 4m4-4v12" />
+                            </svg>
+                            下载 ZIP 包
+                        </button>
+                    </div>
+                </div>
+                <div id="output-gallery" class="result-grid overflow-y-auto p-4 flex-1">
+                    <!-- 结果将在这里生成 -->
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        // --- 变量初始化 ---
+        const canvas = document.getElementById('editorCanvas');
+        const ctx = canvas.getContext('2d');
+        const fileInput = document.getElementById('fileInput');
+        const container = document.getElementById('canvas-container');
+        
+        let originalImage = null; // 当前用于预览/裁切的图片（可能已去水印）
+        let sourceImage = null; // 用户导入的原始图片
+        let activeImageLoadToken = 0; // 防止并发导入覆盖
+        let isCleanupRunning = false;
+        let cleanupJobId = 0;
+        const WATERMARK_STATUS_CLASSES = ['text-gray-400', 'text-blue-400', 'text-green-400', 'text-yellow-400', 'text-red-400'];
+        
+        // 裁切框状态 (相对于原始图片尺寸)
+        let cropState = {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+            isDragging: false,
+            isResizing: false,
+            resizeHandle: null, 
+            dragStartX: 0,
+            dragStartY: 0,
+            initialX: 0,
+            initialY: 0,
+            initialW: 0,
+            initialH: 0
+        };
+
+        const HANDLE_SIZE = 10; 
+
+        // --- 事件监听 ---
+        fileInput.addEventListener('change', handleFileSelect);
+        document.getElementById('rerunCleanupBtn').addEventListener('click', rerunWatermarkCleanup);
+        document.getElementById('restoreOriginalBtn').addEventListener('click', restoreSourceImage);
+        document.getElementById('autoWatermarkToggle').addEventListener('change', () => {
+            const isEnabled = document.getElementById('autoWatermarkToggle').checked;
+            setWatermarkStatus(
+                isEnabled ? '已开启自动去水印（下次导入生效）' : '已关闭自动去水印（下次导入生效）',
+                isEnabled ? 'info' : 'neutral'
+            );
+        });
+        
+        // 关键更新：行/列变化时，如果有锁定比例，需要重新计算框的大小
+        ['rowsInput', 'colsInput'].forEach(id => {
+            document.getElementById(id).addEventListener('input', () => {
+                if(document.getElementById('aspectSelect').value !== 'free') {
+                    applyAspectRatioToCurrentCrop();
+                } else {
+                    drawCanvas();
+                }
+            });
+        });
+
+        ['xInput', 'yInput', 'wInput', 'hInput'].forEach(id => {
+            document.getElementById(id).addEventListener('input', updateCropFromInput);
+        });
+
+        // 比例锁定相关事件
+        document.getElementById('aspectSelect').addEventListener('change', handleRatioChange);
+        document.getElementById('customW').addEventListener('input', handleRatioChange);
+        document.getElementById('customH').addEventListener('input', handleRatioChange);
+
+        // 画布鼠标事件
+        canvas.addEventListener('mousedown', onMouseDown);
+        canvas.addEventListener('mousemove', onMouseMove);
+        canvas.addEventListener('mouseup', onMouseUp);
+        canvas.addEventListener('mouseleave', onMouseUp);
+        
+        // 触屏支持
+        canvas.addEventListener('touchstart', handleTouch);
+        canvas.addEventListener('touchmove', handleTouch);
+        canvas.addEventListener('touchend', handleTouch);
+
+        function handleTouch(e) {
+            e.preventDefault();
+            const touch = e.touches[0] || e.changedTouches[0];
+            const mouseEvent = new MouseEvent(
+                {touchstart:'mousedown', touchmove:'mousemove', touchend:'mouseup'}[e.type], 
+                { clientX: touch.clientX, clientY: touch.clientY }
+            );
+            canvas.dispatchEvent(mouseEvent);
+        }
+
+        function clamp(value, min, max) {
+            return Math.min(Math.max(value, min), max);
+        }
+
+        function setWatermarkStatus(message, tone = 'neutral') {
+            const statusEl = document.getElementById('watermarkStatus');
+            if (!statusEl) return;
+            statusEl.classList.remove(...WATERMARK_STATUS_CLASSES);
+            const toneClass = {
+                neutral: 'text-gray-400',
+                info: 'text-blue-400',
+                success: 'text-green-400',
+                warn: 'text-yellow-400',
+                error: 'text-red-400'
+            };
+            statusEl.classList.add(toneClass[tone] || toneClass.neutral);
+            statusEl.innerText = `状态：${message}`;
+        }
+
+        function updateCleanupButtonsState() {
+            const hasImage = !!sourceImage;
+            document.getElementById('rerunCleanupBtn').disabled = !hasImage || isCleanupRunning;
+            document.getElementById('restoreOriginalBtn').disabled = !hasImage || isCleanupRunning;
+        }
+
+        function createImageFromDataUrl(dataUrl) {
+            return new Promise((resolve, reject) => {
+                const img = new Image();
+                img.onload = () => resolve(img);
+                img.onerror = () => reject(new Error('处理后的图片无法加载'));
+                img.src = dataUrl;
+            });
+        }
+
+        function normalizeCropStateWithinImage() {
+            if (!originalImage) return;
+            cropState.w = clamp(cropState.w, 10, originalImage.width);
+            cropState.h = clamp(cropState.h, 10, originalImage.height);
+            cropState.x = clamp(cropState.x, 0, originalImage.width - cropState.w);
+            cropState.y = clamp(cropState.y, 0, originalImage.height - cropState.h);
+        }
+
+        function applyImageToEditor(image, options = {}) {
+            const keepCrop = !!options.keepCrop;
+            const canKeepCrop = keepCrop && originalImage &&
+                originalImage.width === image.width &&
+                originalImage.height === image.height;
+
+            originalImage = image;
+            canvas.width = originalImage.width;
+            canvas.height = originalImage.height;
+            document.getElementById('empty-state').style.display = 'none';
+
+            if (canKeepCrop) {
+                normalizeCropStateWithinImage();
+                updateInputsFromCrop();
+                drawCanvas();
+                return;
+            }
+
+            cropState.x = 0;
+            cropState.y = 0;
+            cropState.w = originalImage.width;
+            cropState.h = originalImage.height;
+
+            if (document.getElementById('aspectSelect').value !== 'free') {
+                applyAspectRatioToCurrentCrop();
+            } else {
+                updateInputsFromCrop();
+                drawCanvas();
+            }
+        }
+
+        function getCornerRegions(width, height) {
+            const roiW = Math.min(width, Math.max(100, Math.round(width * 0.42)));
+            const roiH = Math.min(height, Math.max(52, Math.round(height * 0.24)));
+            return [
+                { name: 'br', x: width - roiW, y: height - roiH, w: roiW, h: roiH },
+                { name: 'tr', x: width - roiW, y: 0, w: roiW, h: roiH },
+                { name: 'bl', x: 0, y: height - roiH, w: roiW, h: roiH },
+                { name: 'tl', x: 0, y: 0, w: roiW, h: roiH }
+            ];
+        }
+
+        function buildNanoBananaTemplates(cvLib, baseFontPx) {
+            const phrases = ['nano banana', 'Nano Banana', 'NANO BANANA'];
+            const families = ['Arial', 'Segoe UI', 'Helvetica'];
+            const scales = [0.78, 0.95, 1.1, 1.28, 1.48];
+            const templates = [];
+
+            for (const phrase of phrases) {
+                for (const family of families) {
+                    for (const scale of scales) {
+                        const fontSize = Math.max(12, Math.round(baseFontPx * scale));
+                        const tCanvas = document.createElement('canvas');
+                        const tCtx = tCanvas.getContext('2d');
+                        if (!tCtx) continue;
+
+                        tCtx.font = `700 ${fontSize}px ${family}`;
+                        const textW = Math.ceil(tCtx.measureText(phrase).width);
+                        const padX = Math.max(6, Math.round(fontSize * 0.45));
+                        const padY = Math.max(6, Math.round(fontSize * 0.55));
+
+                        tCanvas.width = textW + padX * 2;
+                        tCanvas.height = Math.ceil(fontSize * 1.9) + padY;
+
+                        tCtx.fillStyle = '#151515';
+                        tCtx.fillRect(0, 0, tCanvas.width, tCanvas.height);
+                        tCtx.font = `700 ${fontSize}px ${family}`;
+                        tCtx.textBaseline = 'top';
+                        tCtx.fillStyle = '#f5f5f5';
+                        tCtx.fillText(phrase, padX, Math.round(padY * 0.4));
+
+                        const rgba = cvLib.imread(tCanvas);
+                        const gray = new cvLib.Mat();
+                        const edge = new cvLib.Mat();
+                        cvLib.cvtColor(rgba, gray, cvLib.COLOR_RGBA2GRAY);
+                        cvLib.Canny(gray, edge, 50, 150);
+
+                        templates.push({
+                            mat: edge,
+                            width: edge.cols,
+                            height: edge.rows
+                        });
+
+                        rgba.delete();
+                        gray.delete();
+                    }
+                }
+            }
+
+            return templates;
+        }
+
+        function locateNanoBananaWatermark(cvLib, grayMat, imageWidth, imageHeight) {
+            const baseFont = Math.max(12, Math.min(36, Math.round(imageWidth / 34)));
+            const templates = buildNanoBananaTemplates(cvLib, baseFont);
+            const corners = getCornerRegions(imageWidth, imageHeight);
+            let best = { score: -1, x: 0, y: 0, w: 0, h: 0, corner: 'br' };
+
+            try {
+                for (const corner of corners) {
+                    const roiGray = grayMat.roi(new cvLib.Rect(corner.x, corner.y, corner.w, corner.h));
+                    const roiEdge = new cvLib.Mat();
+                    cvLib.Canny(roiGray, roiEdge, 60, 160);
+
+                    for (const tpl of templates) {
+                        if (tpl.width > roiEdge.cols || tpl.height > roiEdge.rows) continue;
+
+                        const result = new cvLib.Mat();
+                        cvLib.matchTemplate(roiEdge, tpl.mat, result, cvLib.TM_CCOEFF_NORMED);
+                        const mm = cvLib.minMaxLoc(result);
+                        result.delete();
+
+                        if (mm.maxVal > best.score) {
+                            best = {
+                                score: mm.maxVal,
+                                x: corner.x + mm.maxLoc.x,
+                                y: corner.y + mm.maxLoc.y,
+                                w: tpl.width,
+                                h: tpl.height,
+                                corner: corner.name
+                            };
+                        }
+                    }
+
+                    roiEdge.delete();
+                    roiGray.delete();
+
+                    if (corner.name === 'br' && best.score >= 0.56) break;
+                }
+            } finally {
+                templates.forEach(tpl => tpl.mat.delete());
+            }
+
+            return best;
+        }
+
+        function fallbackWatermarkRect(width, height) {
+            const shortEdge = Math.min(width, height);
+            const margin = Math.min(Math.max(2, Math.round(shortEdge * 0.015)), Math.max(2, Math.floor(shortEdge / 3)));
+            const maxW = Math.max(1, width - margin * 2);
+            const maxH = Math.max(1, height - margin * 2);
+            const targetW = Math.min(maxW, Math.max(40, Math.round(width * 0.22)));
+            const targetH = Math.min(maxH, Math.max(20, Math.round(height * 0.09)));
+            const x = clamp(width - targetW - margin, 0, Math.max(0, width - targetW));
+            const y = clamp(height - targetH - margin, 0, Math.max(0, height - targetH));
+            return {
+                x,
+                y,
+                w: Math.max(1, targetW),
+                h: Math.max(1, targetH)
+            };
+        }
+
+        function expandRect(rect, padX, padY, maxW, maxH) {
+            const x = Math.max(0, Math.floor(rect.x - padX));
+            const y = Math.max(0, Math.floor(rect.y - padY));
+            const right = Math.min(maxW, Math.ceil(rect.x + rect.w + padX));
+            const bottom = Math.min(maxH, Math.ceil(rect.y + rect.h + padY));
+            return {
+                x,
+                y,
+                w: Math.max(1, right - x),
+                h: Math.max(1, bottom - y)
+            };
+        }
+
+        async function patchFillFallback(image, targetRect) {
+            const workCanvas = document.createElement('canvas');
+            workCanvas.width = image.width;
+            workCanvas.height = image.height;
+            const workCtx = workCanvas.getContext('2d');
+            if (!workCtx) return image;
+
+            workCtx.drawImage(image, 0, 0);
+
+            let sampleX = targetRect.x - targetRect.w - 6;
+            let sampleY = targetRect.y;
+            if (sampleX < 0) {
+                sampleX = targetRect.x;
+                sampleY = Math.max(0, targetRect.y - targetRect.h - 6);
+            }
+            sampleX = clamp(sampleX, 0, Math.max(0, image.width - targetRect.w));
+            sampleY = clamp(sampleY, 0, Math.max(0, image.height - targetRect.h));
+
+            const sampleCanvas = document.createElement('canvas');
+            sampleCanvas.width = targetRect.w;
+            sampleCanvas.height = targetRect.h;
+            const sampleCtx = sampleCanvas.getContext('2d');
+            if (!sampleCtx) return image;
+            sampleCtx.drawImage(
+                workCanvas,
+                sampleX, sampleY, targetRect.w, targetRect.h,
+                0, 0, targetRect.w, targetRect.h
+            );
+
+            workCtx.save();
+            workCtx.globalAlpha = 0.92;
+            workCtx.filter = 'blur(1px)';
+            workCtx.drawImage(sampleCanvas, targetRect.x, targetRect.y, targetRect.w, targetRect.h);
+            workCtx.restore();
+
+            workCtx.save();
+            const gradient = workCtx.createLinearGradient(
+                targetRect.x, targetRect.y,
+                targetRect.x + targetRect.w, targetRect.y + targetRect.h
+            );
+            gradient.addColorStop(0, 'rgba(0,0,0,0.05)');
+            gradient.addColorStop(0.5, 'rgba(0,0,0,0)');
+            gradient.addColorStop(1, 'rgba(0,0,0,0.05)');
+            workCtx.fillStyle = gradient;
+            workCtx.fillRect(targetRect.x, targetRect.y, targetRect.w, targetRect.h);
+            workCtx.restore();
+
+            return createImageFromDataUrl(workCanvas.toDataURL('image/png'));
+        }
+
+        async function removeNanoBananaWatermark(image) {
+            const fallbackRect = fallbackWatermarkRect(image.width, image.height);
+            const cvReady = typeof window.__waitForCv === 'function'
+                ? await window.__waitForCv(9000)
+                : false;
+
+            if (!cvReady || !window.cv || typeof window.cv.Mat !== 'function') {
+                const patched = await patchFillFallback(image, fallbackRect);
+                return {
+                    image: patched,
+                    cleaned: true,
+                    method: 'patch-fallback',
+                    score: 0.12,
+                    rect: fallbackRect,
+                    reason: window.__cvState?.error || 'OpenCV 未就绪'
+                };
+            }
+
+            const cvLib = window.cv;
+            const workCanvas = document.createElement('canvas');
+            workCanvas.width = image.width;
+            workCanvas.height = image.height;
+            const workCtx = workCanvas.getContext('2d');
+            if (!workCtx) return { image, cleaned: false, method: 'failed', score: 0, reason: 'Canvas 上下文不可用' };
+            workCtx.drawImage(image, 0, 0);
+
+            const srcRgba = cvLib.imread(workCanvas);
+            const srcBgr = new cvLib.Mat();
+            const gray = new cvLib.Mat();
+            const mask = cvLib.Mat.zeros(srcRgba.rows, srcRgba.cols, cvLib.CV_8UC1);
+            const dstBgr = new cvLib.Mat();
+            const dstRgba = new cvLib.Mat();
+
+            try {
+                cvLib.cvtColor(srcRgba, srcBgr, cvLib.COLOR_RGBA2BGR);
+                cvLib.cvtColor(srcRgba, gray, cvLib.COLOR_RGBA2GRAY);
+
+                const candidate = locateNanoBananaWatermark(cvLib, gray, image.width, image.height);
+                const isConfident = Number.isFinite(candidate.score) && candidate.score >= 0.33;
+                const maskRect = isConfident
+                    ? expandRect(
+                        candidate,
+                        Math.round(candidate.w * 0.45),
+                        Math.round(candidate.h * 0.7),
+                        image.width,
+                        image.height
+                    )
+                    : fallbackRect;
+
+                cvLib.rectangle(
+                    mask,
+                    new cvLib.Point(maskRect.x, maskRect.y),
+                    new cvLib.Point(maskRect.x + maskRect.w, maskRect.y + maskRect.h),
+                    new cvLib.Scalar(255, 255, 255, 255),
+                    -1
+                );
+
+                const dilateRadius = Math.max(1, Math.round(Math.min(maskRect.w, maskRect.h) * 0.08));
+                const kernelSize = dilateRadius * 2 + 1;
+                const kernel = cvLib.getStructuringElement(
+                    cvLib.MORPH_ELLIPSE,
+                    new cvLib.Size(kernelSize, kernelSize)
+                );
+                cvLib.dilate(mask, mask, kernel);
+                kernel.delete();
+
+                cvLib.inpaint(srcBgr, mask, dstBgr, 3, cvLib.INPAINT_TELEA);
+                cvLib.cvtColor(dstBgr, dstRgba, cvLib.COLOR_BGR2RGBA);
+                cvLib.imshow(workCanvas, dstRgba);
+
+                const cleanedImage = await createImageFromDataUrl(workCanvas.toDataURL('image/png'));
+                return {
+                    image: cleanedImage,
+                    cleaned: true,
+                    method: isConfident ? 'template' : 'fallback',
+                    score: Math.max(0, candidate.score || 0),
+                    rect: maskRect
+                };
+            } catch (error) {
+                console.error('去水印失败，回退到纹理补丁模式：', error);
+                const patched = await patchFillFallback(image, fallbackRect);
+                return {
+                    image: patched,
+                    cleaned: true,
+                    method: 'patch-fallback',
+                    score: 0.1,
+                    rect: fallbackRect,
+                    reason: error.message || 'OpenCV 去水印异常'
+                };
+            } finally {
+                srcRgba.delete();
+                srcBgr.delete();
+                gray.delete();
+                mask.delete();
+                dstBgr.delete();
+                dstRgba.delete();
+            }
+        }
+
+        async function runCleanupFromSource(loadToken, options = {}) {
+            if (!sourceImage) return;
+            const manual = !!options.manual;
+            const jobId = ++cleanupJobId;
+            isCleanupRunning = true;
+            updateCleanupButtonsState();
+            setWatermarkStatus(manual ? '正在重新去水印...' : '导入完成，正在自动去水印...', 'info');
+            try {
+                const result = await removeNanoBananaWatermark(sourceImage);
+                if (loadToken !== activeImageLoadToken) return;
+
+                applyImageToEditor(result.image, { keepCrop: false });
+                const confidence = Math.round((result.score || 0) * 100);
+                if (result.method === 'template') {
+                    setWatermarkStatus(`已完成去水印（模板置信度 ${confidence}%）`, 'success');
+                } else if (result.method === 'fallback') {
+                    setWatermarkStatus('已完成去水印（低置信度，使用右下角修复）', 'warn');
+                } else if (result.method === 'patch-fallback') {
+                    setWatermarkStatus('已完成去水印（OpenCV 不可用，使用纹理覆盖兜底）', 'warn');
+                } else {
+                    setWatermarkStatus('已完成去水印', 'success');
+                }
+            } catch (error) {
+                console.error('runCleanupFromSource error:', error);
+                if (loadToken === activeImageLoadToken) {
+                    applyImageToEditor(sourceImage, { keepCrop: false });
+                    setWatermarkStatus('去水印异常，已回退到原图', 'error');
+                }
+            } finally {
+                if (jobId === cleanupJobId) {
+                    isCleanupRunning = false;
+                    updateCleanupButtonsState();
+                }
+            }
+        }
+
+        async function rerunWatermarkCleanup() {
+            if (!sourceImage || isCleanupRunning) return;
+            const loadToken = ++activeImageLoadToken;
+            await runCleanupFromSource(loadToken, { manual: true });
+        }
+
+        function restoreSourceImage() {
+            if (!sourceImage || isCleanupRunning) return;
+            activeImageLoadToken++;
+            applyImageToEditor(sourceImage, { keepCrop: true });
+            setWatermarkStatus('已恢复导入原图', 'neutral');
+            updateCleanupButtonsState();
+        }
+
+        // --- 核心功能 (比例逻辑更新) ---
+
+        // 1. 获取当前目标 *单个格子* 的比例，并转换为 *整个裁切框* 应该有的比例
+        // 修正逻辑：如果用户选 1:1，是希望格子是 1:1。
+        // 总宽/总高 = (格宽 * 列数) / (格高 * 行数) = (格宽/格高) * (列数/行数) = 单元比例 * (列数/行数)
+        function getEffectiveTotalRatio() {
+            const select = document.getElementById('aspectSelect');
+            if (select.value === 'free') return null;
+
+            let cellRatio;
+            if (select.value === 'custom') {
+                const w = parseFloat(document.getElementById('customW').value) || 1;
+                const h = parseFloat(document.getElementById('customH').value) || 1;
+                cellRatio = w / h;
+            } else {
+                cellRatio = parseFloat(select.value);
+            }
+
+            const rows = parseInt(document.getElementById('rowsInput').value) || 1;
+            const cols = parseInt(document.getElementById('colsInput').value) || 1;
+            
+            // 返回修正后的总比例
+            return cellRatio * (cols / rows);
+        }
+
+        // 2. 处理比例变化
+        function handleRatioChange() {
+            const select = document.getElementById('aspectSelect');
+            const customBox = document.getElementById('customRatioBox');
+            
+            // 显示/隐藏自定义框
+            if (select.value === 'custom') {
+                customBox.classList.remove('hidden');
+                customBox.classList.add('grid');
+            } else {
+                customBox.classList.add('hidden');
+                customBox.classList.remove('grid');
+            }
+
+            // 立即应用到当前裁切框
+            applyAspectRatioToCurrentCrop();
+        }
+
+        function applyAspectRatioToCurrentCrop() {
+            if (!originalImage) return;
+            const totalRatio = getEffectiveTotalRatio();
+            if (!totalRatio) return; // 自由模式不强制改变
+
+            // 保持宽度，调整高度以适应新的总比例
+            let newH = cropState.w / totalRatio;
+            
+            // 如果高度超出图片边界，则反向调整宽度
+            if (cropState.y + newH > originalImage.height) {
+                newH = originalImage.height - cropState.y;
+                // 再次调整宽度以匹配被限制的高度
+                let newW = newH * totalRatio;
+                if(cropState.x + newW > originalImage.width) {
+                   // 极少数情况宽高都受限，简单重置
+                   centerCropBox();
+                   return;
+                }
+                cropState.w = newW;
+                cropState.h = newH;
+            } else {
+                cropState.h = newH;
+            }
+
+            updateInputsFromCrop();
+            drawCanvas();
+        }
+
+        function handleFileSelect(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function(event) { loadImage(event.target.result); };
+            reader.readAsDataURL(file);
+        }
+
+        function loadDemoImage() {
+            const demoCanvas = document.createElement('canvas');
+            demoCanvas.width = 500;
+            demoCanvas.height = 300;
+            const dCtx = demoCanvas.getContext('2d');
+            dCtx.fillStyle = "#f0f0f0";
+            dCtx.fillRect(0,0,500,300);
+            
+            // 绘制一些演示图形
+            dCtx.font = "20px Arial";
+            dCtx.fillStyle = "#aaa";
+            for(let i=0; i<5; i++) {
+                dCtx.fillRect(i*100+10, 50, 80, 80);
+                dCtx.fillStyle = "#333";
+                dCtx.fillText("Item "+(i+1), i*100+20, 100);
+                dCtx.fillStyle = "#aaa";
+            }
+            loadImage(demoCanvas.toDataURL());
+        }
+
+        function loadImage(src) {
+            const loadToken = ++activeImageLoadToken;
+            const incomingImage = new Image();
+            setWatermarkStatus('正在读取图片...', 'info');
+
+            incomingImage.onload = async function() {
+                if (loadToken !== activeImageLoadToken) return;
+                cleanupJobId++;
+                isCleanupRunning = false;
+                sourceImage = incomingImage;
+                updateCleanupButtonsState();
+
+                const shouldAutoCleanup = document.getElementById('autoWatermarkToggle').checked;
+                if (shouldAutoCleanup) {
+                    await runCleanupFromSource(loadToken, { manual: false });
+                } else {
+                    applyImageToEditor(sourceImage, { keepCrop: false });
+                    setWatermarkStatus('已导入原图（自动去水印关闭）', 'neutral');
+                }
+            };
+
+            incomingImage.onerror = function() {
+                if (loadToken !== activeImageLoadToken) return;
+                cleanupJobId++;
+                isCleanupRunning = false;
+                sourceImage = null;
+                updateCleanupButtonsState();
+                setWatermarkStatus('图片加载失败，请重试', 'error');
+            };
+
+            incomingImage.src = src;
+        }
+
+        function drawCanvas() {
+            if (!originalImage) return;
+
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = rect.width ? (canvas.width / rect.width) : 1;
+            
+            const baseLineWidth = 2;
+            const scaledLineWidth = baseLineWidth * scaleX;
+            const scaledHandleSize = HANDLE_SIZE * scaleX;
+            const fontSize = Math.max(12 * scaleX, 10);
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(originalImage, 0, 0);
+
+            // 遮罩
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+            ctx.fillRect(0, 0, canvas.width, cropState.y); 
+            ctx.fillRect(0, cropState.y + cropState.h, canvas.width, canvas.height - (cropState.y + cropState.h)); 
+            ctx.fillRect(0, cropState.y, cropState.x, cropState.h); 
+            ctx.fillRect(cropState.x + cropState.w, cropState.y, canvas.width - (cropState.x + cropState.w), cropState.h); 
+
+            // 边界
+            ctx.save();
+            ctx.lineWidth = scaledLineWidth;
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+            ctx.strokeRect(cropState.x, cropState.y, cropState.w, cropState.h);
+            ctx.strokeStyle = '#3b82f6';
+            ctx.setLineDash([10 * scaleX, 10 * scaleX]);
+            ctx.strokeRect(cropState.x, cropState.y, cropState.w, cropState.h);
+            ctx.restore();
+
+            // 网格
+            const rows = parseInt(document.getElementById('rowsInput').value) || 1;
+            const cols = parseInt(document.getElementById('colsInput').value) || 1;
+            const cellW = cropState.w / cols;
+            const cellH = cropState.h / rows;
+
+            ctx.save();
+            ctx.beginPath();
+            for (let i = 1; i < cols; i++) {
+                const x = cropState.x + i * cellW;
+                ctx.moveTo(x, cropState.y);
+                ctx.lineTo(x, cropState.y + cropState.h);
+            }
+            for (let i = 1; i < rows; i++) {
+                const y = cropState.y + i * cellH;
+                ctx.moveTo(cropState.x, y);
+                ctx.lineTo(cropState.x + cropState.w, y);
+            }
+            ctx.strokeStyle = 'rgba(0, 0, 0, 0.7)';
+            ctx.lineWidth = scaledLineWidth * 1.5;
+            ctx.stroke();
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+            ctx.lineWidth = scaledLineWidth * 0.5;
+            ctx.setLineDash([4 * scaleX, 4 * scaleX]);
+            ctx.stroke();
+            ctx.restore();
+
+            // 编号
+            if ( (cellW / scaleX) > 25 && (cellH / scaleX) > 20 ) { 
+                ctx.save();
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+                ctx.font = `${fontSize}px sans-serif`;
+                ctx.textBaseline = 'top';
+                ctx.shadowColor = 'rgba(0, 0, 0, 1)';
+                ctx.shadowBlur = 2 * scaleX;
+                for (let r = 0; r < rows; r++) {
+                    for (let c = 0; c < cols; c++) {
+                        const tx = cropState.x + c * cellW + (3 * scaleX);
+                        const ty = cropState.y + r * cellH + (3 * scaleX);
+                        ctx.fillText(`${r+1}-${c+1}`, tx, ty);
+                    }
+                }
+                ctx.restore();
+            }
+
+            // 手柄
+            drawHandle(cropState.x, cropState.y, scaledHandleSize, scaledLineWidth); 
+            drawHandle(cropState.x + cropState.w, cropState.y, scaledHandleSize, scaledLineWidth); 
+            drawHandle(cropState.x, cropState.y + cropState.h, scaledHandleSize, scaledLineWidth); 
+            drawHandle(cropState.x + cropState.w, cropState.y + cropState.h, scaledHandleSize, scaledLineWidth); 
+        }
+
+        function drawHandle(x, y, size, lineWidth) {
+            ctx.save();
+            ctx.fillStyle = '#fff';
+            ctx.strokeStyle = '#3b82f6';
+            ctx.lineWidth = lineWidth;
+            ctx.fillRect(x - size/2, y - size/2, size, size);
+            ctx.strokeRect(x - size/2, y - size/2, size, size);
+            ctx.restore();
+        }
+
+        // --- 鼠标交互 ---
+
+        function getMousePos(evt) {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            return {
+                x: (evt.clientX - rect.left) * scaleX,
+                y: (evt.clientY - rect.top) * scaleY
+            };
+        }
+
+        function onMouseDown(e) {
+            if(!originalImage) return;
+            const pos = getMousePos(e);
+            
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const tolerance = 15 * scaleX; 
+
+            if(hitTest(pos.x, pos.y, cropState.x, cropState.y, tolerance)) { startResize(e, 'nw'); return; }
+            if(hitTest(pos.x, pos.y, cropState.x + cropState.w, cropState.y, tolerance)) { startResize(e, 'ne'); return; }
+            if(hitTest(pos.x, pos.y, cropState.x, cropState.y + cropState.h, tolerance)) { startResize(e, 'sw'); return; }
+            if(hitTest(pos.x, pos.y, cropState.x + cropState.w, cropState.y + cropState.h, tolerance)) { startResize(e, 'se'); return; }
+
+            if (pos.x >= cropState.x && pos.x <= cropState.x + cropState.w &&
+                pos.y >= cropState.y && pos.y <= cropState.y + cropState.h) {
+                
+                cropState.isDragging = true;
+                cropState.dragStartX = pos.x;
+                cropState.dragStartY = pos.y;
+                cropState.initialX = cropState.x;
+                cropState.initialY = cropState.y;
+                canvas.style.cursor = 'move';
+            }
+        }
+
+        function hitTest(mx, my, tx, ty, tolerance) {
+            return Math.abs(mx - tx) <= tolerance && Math.abs(my - ty) <= tolerance;
+        }
+
+        function startResize(e, handle) {
+            cropState.isResizing = true;
+            cropState.resizeHandle = handle;
+            const pos = getMousePos(e);
+            cropState.dragStartX = pos.x;
+            cropState.dragStartY = pos.y;
+            cropState.initialX = cropState.x;
+            cropState.initialY = cropState.y;
+            cropState.initialW = cropState.w;
+            cropState.initialH = cropState.h;
+            e.preventDefault();
+        }
+
+        function onMouseMove(e) {
+            if(!originalImage) return;
+            const pos = getMousePos(e);
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const tolerance = 15 * scaleX;
+
+            if (!cropState.isDragging && !cropState.isResizing) {
+                if (hitTest(pos.x, pos.y, cropState.x, cropState.y, tolerance) || hitTest(pos.x, pos.y, cropState.x + cropState.w, cropState.y + cropState.h, tolerance)) {
+                    canvas.style.cursor = 'nwse-resize'; 
+                } else if (hitTest(pos.x, pos.y, cropState.x + cropState.w, cropState.y, tolerance) || hitTest(pos.x, pos.y, cropState.x, cropState.y + cropState.h, tolerance)) {
+                    canvas.style.cursor = 'nesw-resize'; 
+                } else if (pos.x >= cropState.x && pos.x <= cropState.x + cropState.w && pos.y >= cropState.y && pos.y <= cropState.y + cropState.h) {
+                    canvas.style.cursor = 'move'; 
+                } else {
+                    canvas.style.cursor = 'default';
+                }
+            }
+            
+            if (cropState.isDragging) {
+                const dx = pos.x - cropState.dragStartX;
+                const dy = pos.y - cropState.dragStartY;
+                cropState.x = cropState.initialX + dx;
+                cropState.y = cropState.initialY + dy;
+                updateInputsFromCrop();
+                drawCanvas();
+            } 
+            else if (cropState.isResizing) {
+                const dx = pos.x - cropState.dragStartX;
+                const dy = pos.y - cropState.dragStartY;
+                const minSize = 10; 
+                // 使用修正后的 getEffectiveTotalRatio
+                const totalRatio = getEffectiveTotalRatio(); 
+
+                let newW, newH, newX, newY;
+
+                // 自由缩放逻辑
+                if (!totalRatio) {
+                    if (cropState.resizeHandle === 'se') {
+                        cropState.w = Math.max(minSize, cropState.initialW + dx);
+                        cropState.h = Math.max(minSize, cropState.initialH + dy);
+                    } else if (cropState.resizeHandle === 'sw') {
+                        newW = Math.max(minSize, cropState.initialW - dx);
+                        cropState.x = cropState.initialX + (cropState.initialW - newW);
+                        cropState.w = newW;
+                        cropState.h = Math.max(minSize, cropState.initialH + dy);
+                    } else if (cropState.resizeHandle === 'ne') {
+                        newH = Math.max(minSize, cropState.initialH - dy);
+                        cropState.y = cropState.initialY + (cropState.initialH - newH);
+                        cropState.w = Math.max(minSize, cropState.initialW + dx);
+                        cropState.h = newH;
+                    } else if (cropState.resizeHandle === 'nw') {
+                        newW = Math.max(minSize, cropState.initialW - dx);
+                        newH = Math.max(minSize, cropState.initialH - dy);
+                        cropState.x = cropState.initialX + (cropState.initialW - newW);
+                        cropState.y = cropState.initialY + (cropState.initialH - newH);
+                        cropState.w = newW;
+                        cropState.h = newH;
+                    }
+                } 
+                // 锁定比例缩放逻辑 (使用 totalRatio)
+                else {
+                    if (cropState.resizeHandle === 'se') {
+                        // 1. 计算新的宽度
+                        newW = Math.max(minSize, cropState.initialW + dx);
+                        // 2. 根据 总比例 计算高度
+                        newH = newW / totalRatio;
+                        // 3. 更新
+                        cropState.w = newW;
+                        cropState.h = newH;
+                    } else if (cropState.resizeHandle === 'sw') {
+                        // 向左拖拽，宽度增加是 -dx
+                        newW = Math.max(minSize, cropState.initialW - dx);
+                        newH = newW / totalRatio;
+                        // X需要左移，移动量 = 新宽 - 旧宽
+                        cropState.x = cropState.initialX + (cropState.initialW - newW);
+                        cropState.w = newW;
+                        cropState.h = newH;
+                    } else if (cropState.resizeHandle === 'ne') {
+                        newW = Math.max(minSize, cropState.initialW + dx);
+                        newH = newW / totalRatio;
+                        // Y需要上移，移动量 = 新高 - 旧高
+                        cropState.y = cropState.initialY + (cropState.initialH - newH);
+                        cropState.w = newW;
+                        cropState.h = newH;
+                    } else if (cropState.resizeHandle === 'nw') {
+                        newW = Math.max(minSize, cropState.initialW - dx);
+                        newH = newW / totalRatio;
+                        cropState.x = cropState.initialX + (cropState.initialW - newW);
+                        cropState.y = cropState.initialY + (cropState.initialH - newH);
+                        cropState.w = newW;
+                        cropState.h = newH;
+                    }
+                }
+
+                updateInputsFromCrop();
+                drawCanvas();
+            }
+        }
+
+        function onMouseUp() {
+            cropState.isDragging = false;
+            cropState.isResizing = false;
+            cropState.resizeHandle = null;
+        }
+
+        function updateInputsFromCrop() {
+            document.getElementById('xInput').value = Math.round(cropState.x);
+            document.getElementById('yInput').value = Math.round(cropState.y);
+            document.getElementById('wInput').value = Math.round(cropState.w);
+            document.getElementById('hInput').value = Math.round(cropState.h);
+        }
+
+        function updateCropFromInput() {
+            cropState.x = parseInt(document.getElementById('xInput').value) || 0;
+            cropState.y = parseInt(document.getElementById('yInput').value) || 0;
+            cropState.w = parseInt(document.getElementById('wInput').value) || 100;
+            cropState.h = parseInt(document.getElementById('hInput').value) || 100;
+            
+            // 如果有比例锁定，手动输入W时自动更新H，反之亦然
+            const totalRatio = getEffectiveTotalRatio();
+            if (totalRatio && document.activeElement === document.getElementById('wInput')) {
+                cropState.h = cropState.w / totalRatio;
+                document.getElementById('hInput').value = Math.round(cropState.h);
+            } else if (totalRatio && document.activeElement === document.getElementById('hInput')) {
+                cropState.w = cropState.h * totalRatio;
+                document.getElementById('wInput').value = Math.round(cropState.w);
+            }
+
+            drawCanvas();
+        }
+
+        function resetCropBox() {
+            if(!originalImage) return;
+            cropState.x = 0;
+            cropState.y = 0;
+            cropState.w = originalImage.width;
+            cropState.h = originalImage.height;
+            // 如果有比例，重置时也尝试适应比例
+            const totalRatio = getEffectiveTotalRatio();
+            if(totalRatio) applyAspectRatioToCurrentCrop();
+            else {
+                updateInputsFromCrop();
+                drawCanvas();
+            }
+        }
+
+        function centerCropBox() {
+            if(!originalImage) return;
+            cropState.x = (originalImage.width - cropState.w) / 2;
+            cropState.y = (originalImage.height - cropState.h) / 2;
+            updateInputsFromCrop();
+            drawCanvas();
+        }
+
+        // --- 裁切与生成 ---
+        let generatedBlobs = []; 
+
+        async function generateSlices() {
+            if (!originalImage) {
+                alert("请先上传图片！");
+                return;
+            }
+
+            const rows = parseInt(document.getElementById('rowsInput').value) || 1;
+            const cols = parseInt(document.getElementById('colsInput').value) || 1;
+            const gallery = document.getElementById('output-gallery');
+            const resultPanel = document.getElementById('result-panel');
+            const countDisplay = document.getElementById('count-display');
+            const prefix = document.getElementById('prefixInput').value || 'slice';
+
+            gallery.innerHTML = ''; 
+            generatedBlobs = [];
+            resultPanel.style.height = '300px'; 
+            countDisplay.innerText = rows * cols;
+
+            const cellW = cropState.w / cols;
+            const cellH = cropState.h / rows;
+
+            for (let r = 0; r < rows; r++) {
+                for (let c = 0; c < cols; c++) {
+                    const tCanvas = document.createElement('canvas');
+                    tCanvas.width = cellW;
+                    tCanvas.height = cellH;
+                    const tCtx = tCanvas.getContext('2d');
+
+                    tCtx.drawImage(
+                        originalImage,
+                        cropState.x + c * cellW, 
+                        cropState.y + r * cellH, 
+                        cellW, cellH,            
+                        0, 0, cellW, cellH       
+                    );
+
+                    const dataUrl = tCanvas.toDataURL('image/png');
+                    const fileName = `${prefix}_${r}_${c}.png`;
+
+                    tCanvas.toBlob(blob => {
+                        generatedBlobs.push({ name: fileName, blob: blob });
+                    }, 'image/png');
+
+                    const div = document.createElement('div');
+                    div.className = 'result-item';
+                    const img = document.createElement('img');
+                    img.src = dataUrl;
+                    img.className = 'result-img';
+                    const label = document.createElement('div');
+                    label.innerText = fileName;
+                    label.className = 'text-xs text-gray-400 truncate w-full';
+                    const downloadBtn = document.createElement('a');
+                    downloadBtn.href = dataUrl;
+                    downloadBtn.download = fileName;
+                    downloadBtn.innerHTML = '⬇ 下载';
+                    downloadBtn.className = 'block text-xs text-blue-400 mt-1 hover:text-white';
+
+                    div.appendChild(img);
+                    div.appendChild(label);
+                    div.appendChild(downloadBtn);
+                    gallery.appendChild(div);
+                }
+            }
+            setTimeout(() => { document.getElementById('result-panel').scrollIntoView({behavior: 'smooth'}); }, 300);
+        }
+
+        function downloadZip() {
+            if (generatedBlobs.length === 0) return;
+            const zip = new JSZip();
+            generatedBlobs.forEach(item => { zip.file(item.name, item.blob); });
+            zip.generateAsync({type:"blob"}).then(function(content) { saveAs(content, "slices.zip"); });
+        }
+
+        function closeResults() {
+            document.getElementById('result-panel').style.height = '0px';
+        }
+
+        updateCleanupButtonsState();
+        setWatermarkStatus('等待导入图片', 'neutral');
+    </script>
+</body>
+</html>

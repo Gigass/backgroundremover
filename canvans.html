@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>图片方格拼贴生成器 Pro</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 引入 JSZip 用于打包下载 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&display=swap');
+        
+        body {
+            font-family: 'Noto Sans SC', sans-serif;
+            background-color: #f3f4f6;
+        }
+
+        /* 自定义滚动条 */
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: #f1f1f1;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+
+        .grid-cell {
+            aspect-ratio: 1 / 1;
+            transition: all 0.2s;
+        }
+        
+        /* 拖拽悬停时的样式 */
+        .grid-cell.drag-hover {
+            border-color: #3b82f6 !important;
+            border-width: 2px !important;
+            filter: brightness(0.95);
+            box-shadow: inset 0 0 10px rgba(59, 130, 246, 0.3);
+            transform: scale(0.98);
+        }
+
+        .grid-cell:hover {
+            border-color: #93c5fd;
+            z-index: 10;
+        }
+
+        .asset-item {
+            cursor: grab;
+        }
+        .asset-item:active {
+            cursor: grabbing;
+        }
+
+        .asset-item.active {
+            ring: 4px solid #3b82f6;
+            transform: scale(0.95);
+        }
+
+        /* 文件名悬停显示 */
+        .asset-name-overlay {
+            background: rgba(0,0,0,0.6);
+            backdrop-filter: blur(2px);
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+        .asset-item:hover .asset-name-overlay {
+            opacity: 1;
+        }
+
+        /* 隐藏的文件输入框 */
+        input[type="file"] {
+            display: none;
+        }
+        
+        /* 颜色选择器样式优化 */
+        input[type="color"] {
+            -webkit-appearance: none;
+            border: none;
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            overflow: hidden;
+            cursor: pointer;
+            padding: 0;
+        }
+        input[type="color"]::-webkit-color-swatch-wrapper {
+            padding: 0;
+        }
+        input[type="color"]::-webkit-color-swatch {
+            border: none;
+            border-radius: 50%;
+            border: 1px solid #e5e7eb;
+        }
+
+        /* 画布容器卡片样式 */
+        .canvas-card {
+            transition: all 0.3s ease;
+        }
+        .canvas-card:hover {
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+        }
+
+        /* 镜像翻转类 */
+        .mirror-x {
+            transform: scaleX(-1);
+        }
+    </style>
+</head>
+<body class="h-screen flex flex-col overflow-hidden">
+
+    <!-- 顶部导航栏 -->
+    <header class="bg-white shadow-sm z-10 p-3 border-b border-gray-200">
+        <div class="max-w-full mx-auto flex flex-col xl:flex-row justify-between items-center gap-3">
+            <div class="flex items-center gap-2">
+                <div class="bg-blue-600 text-white p-2 rounded-lg">
+                    <i class="fa-solid fa-layer-group text-lg"></i>
+                </div>
+                <h1 class="text-lg font-bold text-gray-800 hidden md:block">多画布拼贴生成器</h1>
+            </div>
+            
+            <div class="flex flex-wrap items-center gap-3 justify-center">
+                <!-- 尺寸设置 -->
+                <div class="flex items-center gap-2 bg-gray-50 p-1.5 rounded-lg border border-gray-200">
+                    <div class="flex items-center gap-1">
+                        <span class="text-xs font-bold text-gray-500 px-1">行</span>
+                        <input type="number" id="rowsInput" value="1" min="1" max="20" onchange="updateAllGridsLayout()" class="w-12 p-1 border rounded text-center text-sm focus:ring-2 focus:ring-blue-500 outline-none">
+                    </div>
+                    <span class="text-gray-300">|</span>
+                    <div class="flex items-center gap-1">
+                        <span class="text-xs font-bold text-gray-500 px-1">列</span>
+                        <input type="number" id="colsInput" value="5" min="1" max="20" onchange="updateAllGridsLayout()" class="w-12 p-1 border rounded text-center text-sm focus:ring-2 focus:ring-blue-500 outline-none">
+                    </div>
+                </div>
+
+                <!-- 背景色设置 -->
+                <div class="flex items-center gap-2 bg-gray-50 p-1.5 rounded-lg border border-gray-200" title="设置统一背景色">
+                    <span class="text-xs font-bold text-gray-500 px-1">背景</span>
+                    <input type="color" id="bgColorInput" value="#ffffff" onchange="updateBgColor(this.value)">
+                </div>
+
+                <!-- 画布操作 -->
+                <button onclick="addNewCanvas()" class="bg-blue-50 hover:bg-blue-100 text-blue-700 px-3 py-1.5 rounded-lg text-sm font-bold border border-blue-200 transition flex items-center gap-1">
+                    <i class="fa-solid fa-plus"></i> 添加画布
+                </button>
+            </div>
+
+            <div class="flex items-center gap-2">
+                <button onclick="exportAllCanvases()" class="bg-green-600 hover:bg-green-700 text-white px-5 py-2 rounded-lg text-sm font-bold shadow-md flex items-center gap-2 transition transform hover:-translate-y-0.5 active:scale-95">
+                    <i class="fa-solid fa-file-export"></i> 导出 ZIP
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- 主体内容 -->
+    <main class="flex-1 flex flex-col md:flex-row overflow-hidden relative">
+        
+        <!-- 左侧：画布滚动区域 -->
+        <div class="flex-1 bg-gray-100 p-8 overflow-y-auto overflow-x-hidden custom-scrollbar relative" id="main-scroll-area">
+            
+            <!-- 画布列表容器 -->
+            <div id="canvases-container" class="flex flex-col items-center gap-8 pb-20 w-full max-w-5xl mx-auto">
+                <!-- 画布将通过JS动态插入这里 -->
+            </div>
+
+            <!-- 空状态提示 (当所有画布被删除时) -->
+            <div id="empty-state" class="hidden absolute inset-0 flex flex-col items-center justify-center text-gray-400">
+                <i class="fa-regular fa-folder-open text-6xl mb-4 text-gray-300"></i>
+                <p class="text-lg">暂无画布</p>
+                <button onclick="addNewCanvas()" class="mt-4 text-blue-600 hover:underline">点击添加一个新画布</button>
+            </div>
+        </div>
+
+        <!-- 右侧：素材库 -->
+        <div class="w-full md:w-72 bg-white border-l border-gray-200 flex flex-col shadow-xl z-20 shrink-0">
+            <div class="p-4 border-b border-gray-200 bg-gray-50">
+                <div class="flex justify-between items-center mb-2">
+                    <h2 class="font-bold text-gray-700 flex items-center gap-2">
+                        <i class="fa-regular fa-images"></i> 素材库
+                    </h2>
+                    <span class="text-xs text-gray-400 bg-gray-100 px-2 py-0.5 rounded">按名称排序</span>
+                </div>
+                <label class="cursor-pointer w-full block bg-white border-2 border-dashed border-blue-300 hover:border-blue-500 text-blue-500 hover:text-blue-600 text-center py-4 rounded-lg transition group">
+                    <div class="flex flex-col items-center">
+                        <i class="fa-solid fa-cloud-arrow-up text-xl mb-1 group-hover:scale-110 transition"></i>
+                        <span class="text-xs font-medium">点击上传图片</span>
+                    </div>
+                    <input type="file" id="imageUpload" accept="image/*" multiple onchange="handleImageUpload(event)">
+                </label>
+            </div>
+
+            <div class="flex-1 overflow-y-auto p-3 custom-scrollbar">
+                <div class="grid grid-cols-2 gap-2" id="assets-list">
+                    <!-- 通过JS动态渲染 -->
+                </div>
+            </div>
+
+            <div class="p-2 bg-blue-50 border-t border-blue-100 text-xs text-blue-600 text-center font-medium">
+                <i class="fa-solid fa-mouse-pointer mr-1"></i> 将工具/图片拖入画布
+            </div>
+        </div>
+    </main>
+
+    <!-- 隐藏的Canvas用于导出 -->
+    <canvas id="exportCanvas" style="display: none;"></canvas>
+
+    <script>
+        // 全局状态
+        let state = {
+            rows: 1,
+            cols: 5,
+            bgColor: '#ffffff',
+            selectedImage: null, 
+            assets: [], // { name: string, src: string }
+            // 画布数组
+            // data结构更新: { "r-c": { src: string, mirrored: boolean } }
+            canvases: [] 
+        };
+
+        // 生成唯一ID
+        const generateId = () => 'canvas_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+
+        // 初始化
+        window.onload = function() {
+            renderAssetsList(); // 初始化素材库（显示橡皮擦）
+            addNewCanvas();
+        };
+
+        // --- 核心逻辑：画布管理 ---
+
+        // 添加新画布
+        function addNewCanvas() {
+            const newCanvas = {
+                id: generateId(),
+                data: {}
+            };
+            state.canvases.push(newCanvas);
+            renderCanvas(newCanvas);
+            checkEmptyState();
+            
+            // 自动滚动到底部
+            setTimeout(() => {
+                const container = document.getElementById('main-scroll-area');
+                container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+            }, 100);
+        }
+
+        // 复制画布
+        function duplicateCanvas(canvasId) {
+            const original = state.canvases.find(c => c.id === canvasId);
+            if (!original) return;
+
+            // 深拷贝data，确保镜像状态也被复制
+            const newData = {};
+            for (let key in original.data) {
+                // 兼容处理：如果是旧的字符串格式，转为对象；如果是对象，克隆它
+                const item = original.data[key];
+                if (typeof item === 'string') {
+                    newData[key] = { src: item, mirrored: false };
+                } else {
+                    newData[key] = { ...item };
+                }
+            }
+
+            const newCanvas = {
+                id: generateId(),
+                data: newData
+            };
+            
+            // 插入到原画布后面
+            const index = state.canvases.findIndex(c => c.id === canvasId);
+            state.canvases.splice(index + 1, 0, newCanvas);
+            
+            // 重新渲染列表
+            rerenderAllCanvases();
+        }
+
+        // 删除画布
+        function deleteCanvas(canvasId) {
+            if (!confirm('确定要删除这个画布吗？')) return;
+            state.canvases = state.canvases.filter(c => c.id !== canvasId);
+            const el = document.getElementById(canvasId);
+            if(el) el.remove();
+            checkEmptyState();
+        }
+
+        // 更新所有画布的布局（行/列变化时）
+        function updateAllGridsLayout() {
+            const rows = parseInt(document.getElementById('rowsInput').value) || 1;
+            const cols = parseInt(document.getElementById('colsInput').value) || 5;
+
+            if(rows < 1 || cols < 1) return alert("行列数至少为1");
+            if(rows > 50 || cols > 50) return alert("行列数建议不超过50");
+
+            state.rows = rows;
+            state.cols = cols;
+
+            rerenderAllCanvases();
+        }
+
+        // 更新背景色
+        function updateBgColor(color) {
+            state.bgColor = color;
+            // 更新所有格子背景
+            document.querySelectorAll('.grid-cell').forEach(cell => {
+                cell.style.backgroundColor = color;
+            });
+        }
+
+        // 检查空状态
+        function checkEmptyState() {
+            const emptyEl = document.getElementById('empty-state');
+            if (state.canvases.length === 0) {
+                emptyEl.classList.remove('hidden');
+                emptyEl.classList.add('flex');
+            } else {
+                emptyEl.classList.add('hidden');
+                emptyEl.classList.remove('flex');
+            }
+        }
+
+        // --- 渲染逻辑 ---
+
+        function rerenderAllCanvases() {
+            const container = document.getElementById('canvases-container');
+            container.innerHTML = '';
+            state.canvases.forEach(canvas => renderCanvas(canvas));
+        }
+
+        // 渲染单个画布 DOM
+        function renderCanvas(canvasObj) {
+            const container = document.getElementById('canvases-container');
+            
+            // 创建外层卡片
+            const card = document.createElement('div');
+            card.id = canvasObj.id;
+            card.className = "canvas-card bg-white p-4 rounded-xl shadow-sm border border-gray-200 w-full transition-all";
+            
+            // 卡片头部
+            const header = document.createElement('div');
+            header.className = "flex justify-between items-center mb-3 border-b border-gray-100 pb-2";
+            
+            // 标题序号
+            const index = state.canvases.findIndex(c => c.id === canvasObj.id) + 1;
+            header.innerHTML = `
+                <div class="flex items-center gap-2">
+                    <span class="bg-gray-100 text-gray-500 text-xs font-bold px-2 py-1 rounded">#${index}</span>
+                    <span class="text-sm font-medium text-gray-600">画布 ${index}</span>
+                </div>
+                <div class="flex gap-2">
+                    <button onclick="duplicateCanvas('${canvasObj.id}')" class="text-blue-500 hover:bg-blue-50 p-1.5 rounded transition text-xs flex items-center gap-1" title="复制画布">
+                        <i class="fa-regular fa-copy"></i> 复制
+                    </button>
+                    <button onclick="deleteCanvas('${canvasObj.id}')" class="text-red-500 hover:bg-red-50 p-1.5 rounded transition text-xs flex items-center gap-1" title="删除画布">
+                        <i class="fa-regular fa-trash-can"></i> 删除
+                    </button>
+                </div>
+            `;
+
+            // 网格容器
+            const grid = document.createElement('div');
+            grid.className = "grid-container mx-auto select-none";
+            grid.style.display = 'grid';
+            grid.style.gridTemplateColumns = `repeat(${state.cols}, 1fr)`;
+            grid.style.gap = '0'; // 无缝拼接
+            grid.style.backgroundColor = 'transparent'; 
+            grid.style.border = '1px solid #e5e7eb'; 
+            grid.style.width = 'fit-content';
+            
+            // 动态计算单元格大小
+            let baseSize = 80; 
+            if (state.cols > 8) baseSize = 60;
+            if (state.cols > 15) baseSize = 40;
+
+            // 生成格子
+            for (let r = 0; r < state.rows; r++) {
+                for (let c = 0; c < state.cols; c++) {
+                    const cellKey = `${r}-${c}`;
+                    const cell = document.createElement('div');
+                    cell.className = 'grid-cell relative overflow-hidden flex items-center justify-center border border-transparent box-border';
+                    cell.style.width = `${baseSize}px`;
+                    cell.style.height = `${baseSize}px`;
+                    cell.style.backgroundColor = state.bgColor; 
+                    
+                    // 拖拽事件
+                    cell.ondragover = (e) => handleDragOver(e, cell);
+                    cell.ondragleave = (e) => handleDragLeave(e, cell);
+                    cell.ondrop = (e) => handleDrop(e, canvasObj.id, r, c, cell);
+                    cell.onclick = () => handleCellClick(canvasObj.id, r, c, cell);
+
+                    // 填充已有图片
+                    const cellData = canvasObj.data[cellKey];
+                    if (cellData) {
+                        // 兼容旧数据（如果是字符串）
+                        if (typeof cellData === 'string') {
+                            renderImageInCell(cell, cellData, false);
+                        } else {
+                            renderImageInCell(cell, cellData.src, cellData.mirrored);
+                        }
+                    }
+
+                    grid.appendChild(cell);
+                }
+            }
+
+            card.appendChild(header);
+            card.appendChild(grid);
+            container.appendChild(card);
+        }
+
+        function renderImageInCell(cell, src, mirrored) {
+            cell.innerHTML = ''; 
+            const img = document.createElement('img');
+            img.src = src;
+            // 如果镜像，添加css类
+            img.className = 'w-full h-full object-cover pointer-events-none animate-fade-in block ' + (mirrored ? 'mirror-x' : '');
+            img.style.animation = 'fadeIn 0.2s ease-out';
+            cell.appendChild(img);
+        }
+
+        // --- 交互逻辑 ---
+
+        // 1. 拖拽 & 点击 处理
+        function handleDragStart(e, toolType) {
+            e.dataTransfer.setData("text/plain", toolType);
+            e.dataTransfer.effectAllowed = "copy";
+            
+            if (toolType === 'eraser' || toolType === 'mirror') {
+                selectTool(toolType);
+            } else {
+                state.selectedImage = toolType;
+                renderAssetsList(); 
+            }
+        }
+
+        function handleDragOver(e, cell) {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "copy";
+            cell.classList.add('drag-hover');
+        }
+
+        function handleDragLeave(e, cell) {
+            cell.classList.remove('drag-hover');
+        }
+
+        function handleDrop(e, canvasId, r, c, cell) {
+            e.preventDefault();
+            cell.classList.remove('drag-hover');
+            const data = e.dataTransfer.getData("text/plain");
+            if (data) updateCanvasData(canvasId, r, c, data, cell);
+        }
+
+        function handleCellClick(canvasId, r, c, cell) {
+            if (!state.selectedImage) return;
+            updateCanvasData(canvasId, r, c, state.selectedImage, cell);
+        }
+
+        // 统一更新数据
+        function updateCanvasData(canvasId, r, c, toolOrSrc, cell) {
+            const canvasObj = state.canvases.find(c => c.id === canvasId);
+            if (!canvasObj) return;
+
+            const key = `${r}-${c}`;
+            
+            if (toolOrSrc === 'eraser') {
+                delete canvasObj.data[key];
+                cell.innerHTML = '';
+            } 
+            else if (toolOrSrc === 'mirror') {
+                // 镜像工具逻辑
+                const currentData = canvasObj.data[key];
+                if (currentData) {
+                    // 兼容旧数据
+                    let src = typeof currentData === 'string' ? currentData : currentData.src;
+                    let mirrored = typeof currentData === 'string' ? false : currentData.mirrored;
+                    
+                    // 切换镜像状态
+                    mirrored = !mirrored;
+                    
+                    // 保存新状态
+                    canvasObj.data[key] = { src, mirrored };
+                    renderImageInCell(cell, src, mirrored);
+                }
+            } 
+            else {
+                // 填充新图片（重置镜像状态）
+                canvasObj.data[key] = { src: toolOrSrc, mirrored: false };
+                renderImageInCell(cell, toolOrSrc, false);
+            }
+        }
+
+        // 2. 素材上传与管理
+        function handleImageUpload(event) {
+            const files = Array.from(event.target.files).filter(f => f.type.startsWith('image/'));
+            if (!files.length) return;
+
+            files.forEach(file => {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const imgSrc = e.target.result;
+                    
+                    state.assets.push({
+                        name: file.name,
+                        src: imgSrc
+                    });
+                    
+                    state.assets.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN', { numeric: true }));
+                    
+                    renderAssetsList();
+
+                    if (!state.selectedImage) {
+                        state.selectedImage = imgSrc;
+                        renderAssetsList(); 
+                    }
+                };
+                reader.readAsDataURL(file);
+            });
+            event.target.value = '';
+        }
+
+        function selectTool(tool) {
+            state.selectedImage = tool;
+            renderAssetsList();
+        }
+
+        // 渲染素材列表
+        function renderAssetsList() {
+            const list = document.getElementById('assets-list');
+            list.innerHTML = ''; // 清空
+
+            // 0. 工具容器 (Grid布局)
+            const toolsContainer = document.createElement('div');
+            toolsContainer.className = "col-span-2 grid grid-cols-2 gap-2 mb-2";
+
+            // 1. 添加橡皮擦
+            const eraserDiv = createToolItem('eraser', 'fa-eraser', '拖拽清除', 'text-gray-500 hover:text-red-500');
+            toolsContainer.appendChild(eraserDiv);
+
+            // 2. 添加镜像工具
+            const mirrorDiv = createToolItem('mirror', 'fa-right-left', '左右镜像', 'text-gray-500 hover:text-blue-500');
+            toolsContainer.appendChild(mirrorDiv);
+
+            list.appendChild(toolsContainer);
+
+            // 3. 添加排序后的图片
+            state.assets.forEach(asset => {
+                const div = document.createElement('div');
+                div.className = 'asset-item cursor-grab rounded-lg overflow-hidden border border-gray-200 hover:shadow-md aspect-square bg-white relative group';
+                div.draggable = true;
+                div.ondragstart = (e) => handleDragStart(e, asset.src);
+                div.onclick = () => selectTool(asset.src);
+                
+                const img = document.createElement('img');
+                img.src = asset.src;
+                img.className = 'w-full h-full object-cover pointer-events-none';
+                
+                const overlay = document.createElement('div');
+                overlay.className = 'asset-name-overlay absolute bottom-0 left-0 right-0 text-white text-[10px] truncate px-1 py-1 pointer-events-none text-center';
+                overlay.innerText = asset.name;
+
+                div.appendChild(img);
+                div.appendChild(overlay);
+                
+                if (state.selectedImage === asset.src) div.classList.add('active');
+
+                list.appendChild(div);
+            });
+        }
+
+        function createToolItem(type, iconClass, label, colorClass) {
+            const div = document.createElement('div');
+            div.className = `asset-item rounded-lg overflow-hidden border border-gray-200 hover:shadow-md h-20 flex flex-col items-center justify-center bg-gray-50 transition relative ${colorClass}`;
+            div.draggable = true;
+            div.ondragstart = (e) => handleDragStart(e, type);
+            div.onclick = () => selectTool(type);
+            div.title = `点击选中或拖拽到格子上使用`;
+            div.innerHTML = `
+                <i class="fa-solid ${iconClass} text-xl mb-1 pointer-events-none"></i>
+                <span class="text-[10px] pointer-events-none">${label}</span>
+            `;
+            if (state.selectedImage === type) div.classList.add('active');
+            return div;
+        }
+
+        // --- 导出逻辑 (ZIP优化) ---
+
+        async function exportAllCanvases() {
+            if (state.canvases.length === 0) return alert("没有可以导出的画布");
+            
+            const btn = document.querySelector('button[onclick="exportAllCanvases()"]');
+            const originalText = btn.innerHTML;
+            btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> 打包中...`;
+            btn.disabled = true;
+
+            const zip = new JSZip();
+            const canvas = document.getElementById('exportCanvas');
+            const ctx = canvas.getContext('2d');
+            const CELL_SIZE = 300; 
+
+            // 遍历所有画布，绘制并添加到 ZIP
+            for (let i = 0; i < state.canvases.length; i++) {
+                const canvasObj = state.canvases[i];
+                
+                // 设置画布尺寸
+                const width = state.cols * CELL_SIZE;
+                const height = state.rows * CELL_SIZE;
+                canvas.width = width;
+                canvas.height = height;
+
+                // 填充背景色
+                ctx.fillStyle = state.bgColor;
+                ctx.fillRect(0, 0, width, height);
+
+                const renderPromises = [];
+                for (let r = 0; r < state.rows; r++) {
+                    for (let c = 0; c < state.cols; c++) {
+                        const key = `${r}-${c}`;
+                        let cellData = canvasObj.data[key];
+
+                        if (cellData) {
+                            const imgSrc = typeof cellData === 'string' ? cellData : cellData.src;
+                            const isMirrored = typeof cellData === 'string' ? false : cellData.mirrored;
+
+                            const p = new Promise((resolve) => {
+                                const img = new Image();
+                                img.onload = () => {
+                                    // 导出时处理镜像
+                                    ctx.save();
+                                    if (isMirrored) {
+                                        ctx.translate(c * CELL_SIZE + CELL_SIZE, r * CELL_SIZE);
+                                        ctx.scale(-1, 1);
+                                        drawImageProp(ctx, img, 0, 0, CELL_SIZE, CELL_SIZE);
+                                    } else {
+                                        drawImageProp(ctx, img, c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+                                    }
+                                    ctx.restore();
+                                    resolve();
+                                };
+                                img.onerror = resolve;
+                                img.src = imgSrc;
+                            });
+                            renderPromises.push(p);
+                        }
+                    }
+                }
+
+                // 等待当前画布的所有图片绘制完成
+                await Promise.all(renderPromises);
+
+                // 将 Canvas 转为 Blob 并添加到 Zip
+                const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+                const fileName = `Canvas_${i + 1}.png`;
+                zip.file(fileName, blob);
+            }
+
+            // 生成并下载 ZIP
+            try {
+                const content = await zip.generateAsync({type:"blob"});
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(content);
+                link.download = `Grid_Art_Pack_${new Date().getTime()}.zip`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(link.href);
+            } catch (err) {
+                console.error("Zip generation error:", err);
+                alert("打包失败，请重试");
+            }
+
+            btn.innerHTML = originalText;
+            btn.disabled = false;
+        }
+
+        // 辅助绘制函数 (Object-fit: cover)
+        function drawImageProp(ctx, img, x, y, w, h, offsetX, offsetY) {
+            if (arguments.length === 2) {
+                x = y = 0;
+                w = ctx.canvas.width;
+                h = ctx.canvas.height;
+            }
+            offsetX = typeof offsetX === "number" ? offsetX : 0.5;
+            offsetY = typeof offsetY === "number" ? offsetY : 0.5;
+
+            if (offsetX < 0) offsetX = 0;
+            if (offsetY < 0) offsetY = 0;
+            if (offsetX > 1) offsetX = 1;
+            if (offsetY > 1) offsetY = 1;
+
+            var iw = img.width,
+                ih = img.height,
+                r = Math.min(w / iw, h / ih),
+                nw = iw * r,
+                nh = ih * r,
+                cx, cy, cw, ch, ar = 1;
+
+            if (nw < w) ar = w / nw;                             
+            if (Math.abs(ar - 1) < 1e-14 && nh < h) ar = h / nh;
+            nw *= ar;
+            nh *= ar;
+
+            cw = iw / (nw / w);
+            ch = ih / (nh / h);
+
+            cx = (iw - cw) * offsetX;
+            cy = (ih - ch) * offsetY;
+
+            if (cx < 0) cx = 0;
+            if (cy < 0) cy = 0;
+            if (cw > iw) cw = iw;
+            if (ch > ih) ch = ih;
+
+            ctx.drawImage(img, cx, cy, cw, ch,  x, y, w, h);
+        }
+
+        const styleSheet = document.createElement("style");
+        styleSheet.innerText = `
+            @keyframes fadeIn {
+                from { opacity: 0; transform: scale(0.9); }
+                to { opacity: 1; transform: scale(1); }
+            }
+        `;
+        document.head.appendChild(styleSheet);
+
+    </script>
+</body>
+</html>

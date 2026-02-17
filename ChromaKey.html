@@ -1,0 +1,947 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>视频色度抠图工具 (WebM/HEVC导出)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #1a1a1a;
+            color: #e5e5e5;
+            font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        }
+        /* 自定义滚动条 */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #2d2d2d; 
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #555; 
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #777; 
+        }
+        
+        /* 透明背景网格 */
+        .checkerboard {
+            background-image: 
+                linear-gradient(45deg, #2a2a2a 25%, transparent 25%), 
+                linear-gradient(-45deg, #2a2a2a 25%, transparent 25%), 
+                linear-gradient(45deg, transparent 75%, #2a2a2a 75%), 
+                linear-gradient(-45deg, transparent 75%, #2a2a2a 75%);
+            background-size: 20px 20px;
+            background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+            background-color: #141414;
+        }
+
+        input[type="range"] {
+            -webkit-appearance: none;
+            background: transparent;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 16px;
+            width: 16px;
+            border-radius: 50%;
+            background: #3b82f6;
+            margin-top: -6px;
+            cursor: pointer;
+            border: 2px solid #1f2937;
+        }
+        input[type="range"]::-webkit-slider-thumb:hover {
+            transform: scale(1.1);
+        }
+        input[type="range"]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 4px;
+            background: #4b5563;
+            border-radius: 2px;
+        }
+        
+        /* 单选按钮样式 */
+        .radio-card:checked + div {
+            border-color: #3b82f6;
+            background-color: rgba(59, 130, 246, 0.1);
+        }
+        .radio-card:checked + div .radio-indicator {
+            background-color: #3b82f6;
+            border-color: #3b82f6;
+        }
+        /* 导出格式选中样式 */
+        .format-radio:checked + div {
+            background-color: #2563eb;
+            border-color: #60a5fa;
+            color: white;
+        }
+        .format-radio:checked + div .desc-text {
+            color: #dbeafe;
+        }
+        /* 禁用样式 */
+        .format-radio:disabled + div {
+            opacity: 0.5;
+            cursor: not-allowed;
+            background-color: #374151;
+            border-color: #4b5563;
+        }
+    </style>
+</head>
+<body class="h-screen flex flex-col overflow-hidden">
+
+    <!-- 顶部栏 -->
+    <header class="bg-gray-900 border-b border-gray-800 p-4 flex justify-between items-center shrink-0">
+        <div class="flex items-center gap-3">
+            <div class="bg-blue-600 w-8 h-8 rounded flex items-center justify-center">
+                <i class="fas fa-video text-white text-sm"></i>
+            </div>
+            <h1 class="text-lg font-bold tracking-wide">ChromaKey Pro <span class="text-xs text-gray-400 font-normal ml-2">透明视频生成器</span></h1>
+        </div>
+        <div class="text-sm text-gray-400 flex items-center gap-4">
+            <span id="resolutionDisplay" class="hidden bg-gray-800 px-2 py-1 rounded text-xs text-blue-400 font-mono border border-gray-700">
+                <i class="fas fa-ruler-combined mr-1"></i><span id="resText">0x0</span>
+            </span>
+            <span><i class="fas fa-info-circle mr-1"></i> 建议使用 Chrome 或 Edge</span>
+        </div>
+    </header>
+
+    <!-- 主内容区 -->
+    <main class="flex-1 flex overflow-hidden">
+        
+        <!-- 左侧控制面板 -->
+        <aside class="w-80 bg-gray-800 border-r border-gray-700 p-6 flex flex-col gap-6 overflow-y-auto shrink-0 z-10 shadow-lg">
+            
+            <!-- 1. 上传 -->
+            <div class="space-y-3">
+                <h2 class="text-xs font-bold text-blue-400 uppercase tracking-wider mb-2">1. 视频源</h2>
+                <div class="relative group">
+                    <input type="file" id="videoUpload" accept="video/*" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10">
+                    <div class="border-2 border-dashed border-gray-600 rounded-lg p-4 text-center group-hover:border-blue-500 group-hover:bg-gray-750 transition-all bg-gray-800/50">
+                        <i class="fas fa-cloud-upload-alt text-2xl text-gray-400 mb-2 group-hover:text-blue-400"></i>
+                        <p class="text-xs text-gray-300">点击上传视频 / 重新上传</p>
+                    </div>
+                </div>
+            </div>
+
+            <hr class="border-gray-700">
+
+            <!-- 2. 抠图设置 -->
+            <div class="space-y-5">
+                <div class="flex justify-between items-center">
+                    <h2 class="text-xs font-bold text-blue-400 uppercase tracking-wider">2. 抠图参数</h2>
+                    <button id="pickColorBtn" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded border border-gray-600 transition-colors flex items-center gap-1">
+                        <i class="fas fa-eye-dropper"></i> 吸管
+                    </button>
+                </div>
+
+                <!-- 颜色选择器 -->
+                <div class="flex items-center gap-3 bg-gray-900 p-2 rounded border border-gray-700">
+                    <input type="color" id="keyColor" value="#00ff00" class="w-8 h-8 rounded cursor-pointer bg-transparent border-0 p-0">
+                    <div class="flex flex-col flex-1">
+                        <span class="text-[10px] text-gray-500 uppercase">Key Color</span>
+                        <span class="text-xs font-mono text-gray-300" id="colorHex">#00FF00</span>
+                    </div>
+                    <div class="w-6 h-6 rounded border border-gray-600 shadow-inner" id="colorPreview" style="background-color: #00ff00;"></div>
+                </div>
+                
+                <!-- 遮罩模式开关 -->
+                <div class="flex items-center justify-between bg-gray-700/30 p-2 rounded border border-gray-600/30">
+                    <label class="text-xs text-gray-300 cursor-pointer flex-1 flex items-center gap-2" for="showMask">
+                        <i class="fas fa-mask text-gray-400"></i>
+                        显示蒙版 (Show Mask)
+                    </label>
+                    <input type="checkbox" id="showMask" class="w-4 h-4 rounded border-gray-500 text-blue-600 focus:ring-blue-500 bg-gray-800">
+                </div>
+
+                <!-- 容差 -->
+                <div>
+                    <div class="flex justify-between mb-1">
+                        <label class="text-xs text-gray-300">颜色容差 (Tolerance)</label>
+                        <span id="toleranceVal" class="text-xs text-blue-400 font-mono">150</span>
+                    </div>
+                    <input type="range" id="tolerance" min="0" max="450" value="150" class="w-full">
+                    <p class="text-[10px] text-gray-500 mt-1">控制被扣除颜色的范围</p>
+                </div>
+
+                <!-- 平滑 -->
+                <div>
+                    <div class="flex justify-between mb-1">
+                        <label class="text-xs text-gray-300">边缘清洁度 (Edge Clean)</label>
+                        <span id="smoothingVal" class="text-xs text-blue-400 font-mono">20</span>
+                    </div>
+                    <input type="range" id="smoothing" min="0" max="100" value="20" class="w-full">
+                    <p class="text-[10px] text-gray-500 mt-1">基础边缘的硬度，建议保持较低</p>
+                </div>
+
+                <!-- 羽化 (核心实现) -->
+                <div class="bg-gray-700/20 p-2 rounded border border-blue-500/30">
+                    <div class="flex justify-between mb-1">
+                        <label class="text-xs text-blue-300 flex items-center gap-1 font-bold">
+                            <i class="fas fa-feather-alt"></i> 蒙版羽化 (Mask Feather)
+                        </label>
+                        <span id="featherVal" class="text-xs text-blue-400 font-mono">0px</span>
+                    </div>
+                    <input type="range" id="feather" min="0" max="100" step="1" value="0" class="w-full">
+                    <p class="text-[10px] text-gray-400 mt-1">模拟剪映效果：对边缘进行高斯模糊</p>
+                </div>
+
+                <!-- 溢出抑制 -->
+                <div class="flex items-center justify-between bg-gray-900/50 p-2 rounded border border-gray-700/50">
+                    <label class="text-xs text-gray-300 cursor-pointer flex-1" for="spillRemoval">
+                        去除溢色 (Despill)
+                        <div class="text-[10px] text-gray-500">自动去除边缘的绿色/蓝色反光</div>
+                    </label>
+                    <div class="relative inline-block w-10 mr-2 align-middle select-none transition duration-200 ease-in">
+                        <input type="checkbox" name="spillRemoval" id="spillRemoval" class="toggle-checkbox absolute block w-5 h-5 rounded-full bg-white border-4 appearance-none cursor-pointer border-gray-600 checked:right-0 checked:border-blue-600 transition-all duration-300 right-5" checked/>
+                        <label for="spillRemoval" class="toggle-label block overflow-hidden h-5 rounded-full bg-gray-600 cursor-pointer checked:bg-blue-600"></label>
+                    </div>
+                </div>
+            </div>
+
+            <hr class="border-gray-700">
+
+            <!-- 3. 背景设置 -->
+            <div class="space-y-3">
+                <h2 class="text-xs font-bold text-blue-400 uppercase tracking-wider">3. 背景合成</h2>
+                
+                <div class="grid grid-cols-2 gap-2">
+                    <!-- 透明选项 -->
+                    <label class="cursor-pointer">
+                        <input type="radio" name="bgMode" value="transparent" class="radio-card hidden" checked>
+                        <div class="border border-gray-600 rounded p-2 flex items-center gap-2 hover:bg-gray-700 transition-colors">
+                            <div class="radio-indicator w-3 h-3 rounded-full border border-gray-400"></div>
+                            <span class="text-xs text-gray-300">透明背景</span>
+                        </div>
+                    </label>
+
+                    <!-- 纯色选项 -->
+                    <label class="cursor-pointer">
+                        <input type="radio" name="bgMode" value="color" class="radio-card hidden">
+                        <div class="border border-gray-600 rounded p-2 flex items-center gap-2 hover:bg-gray-700 transition-colors">
+                            <div class="radio-indicator w-3 h-3 rounded-full border border-gray-400"></div>
+                            <span class="text-xs text-gray-300">纯色背景</span>
+                        </div>
+                    </label>
+                </div>
+
+                <!-- 背景颜色选择器 -->
+                <div id="bgColorControl" class="hidden animate-fade-in">
+                    <div class="flex items-center gap-3 bg-gray-900 p-2 rounded border border-gray-700">
+                        <input type="color" id="bgColor" value="#ffffff" class="w-8 h-8 rounded cursor-pointer bg-transparent border-0 p-0">
+                        <div class="flex flex-col flex-1">
+                            <span class="text-[10px] text-gray-500 uppercase">Background Color</span>
+                            <span class="text-xs font-mono text-gray-300" id="bgColorHex">#FFFFFF</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <hr class="border-gray-700">
+
+            <!-- 4. 导出 -->
+            <div class="space-y-3 mt-auto">
+                <h2 class="text-xs font-bold text-blue-400 uppercase tracking-wider">4. 导出设置</h2>
+                
+                <!-- 导出格式选择 -->
+                <div class="bg-gray-700/30 p-2 rounded border border-gray-600/50">
+                    <label class="text-xs text-gray-300 block mb-2 font-semibold">导出格式 (Format)</label>
+                    <div class="grid grid-cols-2 gap-2">
+                        <!-- WebM Option -->
+                        <label class="cursor-pointer" title="通用格式，支持 Chrome/Edge/Firefox">
+                            <input type="radio" name="exportFormat" value="webm" class="format-radio hidden" checked>
+                            <div class="border border-gray-600 rounded p-3 flex flex-col items-center justify-center gap-1 hover:bg-gray-700 transition-colors h-full text-center">
+                                <span class="text-sm font-bold">WebM</span>
+                                <span class="desc-text text-[9px] text-gray-400">VP9 Alpha (推荐)</span>
+                            </div>
+                        </label>
+                        <!-- HEVC Option -->
+                        <label class="cursor-pointer" id="hevcLabel" title="通常仅 macOS Safari 支持">
+                            <input type="radio" name="exportFormat" value="hevc" id="hevcRadio" class="format-radio hidden">
+                            <div class="border border-gray-600 rounded p-3 flex flex-col items-center justify-center gap-1 hover:bg-gray-700 transition-colors h-full text-center">
+                                <span class="text-sm font-bold">HEVC</span>
+                                <span class="desc-text text-[9px] text-gray-400" id="hevcDesc">H.265 (Safari专用)</span>
+                            </div>
+                        </label>
+                    </div>
+                    <div id="hevcWarning" class="hidden mt-2 p-2 bg-yellow-900/30 border border-yellow-700/50 rounded text-[9px] text-yellow-400 leading-relaxed">
+                        <i class="fas fa-info-circle mr-1"></i> <strong>兼容性提示：</strong><br>
+                        HEVC (H.265) 透明视频仅 <strong>macOS/iOS Safari</strong> 浏览器支持。<br>
+                        Windows 用户 (Chrome/Edge) 请使用 <strong>WebM</strong> 以获得透明通道支持。
+                    </div>
+                    <div id="hevcError" class="hidden mt-2 p-2 bg-red-900/30 border border-red-700/50 rounded text-[9px] text-red-300">
+                        <i class="fas fa-times-circle mr-1"></i> 当前浏览器内核不支持录制 HEVC 格式。
+                    </div>
+                </div>
+
+                <!-- 导出质量与分辨率 (新增) -->
+                <div class="grid grid-cols-2 gap-2 mb-1">
+                    <div class="bg-gray-700/30 p-2 rounded border border-gray-600/50">
+                        <label class="text-[10px] text-gray-400 block mb-1 font-semibold">输出分辨率 (Resolution)</label>
+                        <select id="resolutionSelect" class="w-full bg-gray-800 border border-gray-600 text-gray-300 text-xs rounded p-1 focus:ring-blue-500 focus:border-blue-500">
+                            <option value="original" selected>原始 (Original)</option>
+                            <option value="1080">1080p</option>
+                            <option value="720">720p</option>
+                            <option value="480">480p</option>
+                        </select>
+                    </div>
+                    <div class="bg-gray-700/30 p-2 rounded border border-gray-600/50">
+                        <label class="text-[10px] text-gray-400 block mb-1 font-semibold">导出质量 (Bitrate)</label>
+                        <select id="exportQuality" class="w-full bg-gray-800 border border-gray-600 text-gray-300 text-xs rounded p-1 focus:ring-blue-500 focus:border-blue-500">
+                            <option value="20000000">无损 (Ultra)</option>
+                            <option value="10000000" selected>高 (High)</option>
+                            <option value="5000000">中 (Medium)</option>
+                            <option value="2000000">低 (Low)</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- 播放速度 -->
+                <div class="bg-gray-700/30 p-2 rounded border border-gray-600/50 mb-1">
+                    <div class="flex justify-between mb-1 items-center">
+                        <label class="text-xs text-gray-300">导出/播放速度</label>
+                        <div class="flex items-center gap-2">
+                            <span id="speedVal" class="text-xs text-blue-400 font-mono">1.0x</span>
+                            <button id="resetSpeedBtn" class="text-[10px] text-gray-500 hover:text-white" title="重置速度">
+                                <i class="fas fa-undo"></i>
+                            </button>
+                        </div>
+                    </div>
+                    <input type="range" id="playbackRate" min="0.25" max="2.0" step="0.25" value="1.0" class="w-full">
+                </div>
+
+                <div class="grid grid-cols-2 gap-2">
+                    <button id="togglePlayBtn" class="bg-gray-700 hover:bg-gray-600 text-white py-3 rounded transition-colors text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                        <i class="fas fa-play mr-1"></i> 预览播放
+                    </button>
+                    <!-- 导出按钮 -->
+                    <button id="exportBtn" class="bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-500 hover:to-blue-600 text-white py-3 rounded transition-all text-xs font-bold shadow-lg disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                        <i class="fas fa-file-export mr-1"></i> 开始导出
+                    </button>
+                </div>
+            </div>
+        </aside>
+
+        <!-- 右侧画布区 -->
+        <section class="flex-1 bg-black relative flex items-center justify-center p-8 overflow-hidden checkerboard">
+            
+            <!-- 提示文字 -->
+            <div id="emptyState" class="text-center select-none pointer-events-none">
+                <i class="fas fa-film text-6xl text-gray-700 mb-4"></i>
+                <p class="text-gray-500 text-lg">请在左侧上传视频以开始</p>
+            </div>
+
+            <!-- 隐藏的源视频 -->
+            <video id="sourceVideo" class="hidden" loop muted playsinline crossorigin="anonymous"></video>
+
+            <!-- 处理后的画布 -->
+            <canvas id="outputCanvas" class="max-w-full max-h-full shadow-2xl border border-gray-800 hidden"></canvas>
+
+            <!-- 吸管模式遮罩 -->
+            <div id="pickerOverlay" class="absolute inset-0 z-50 cursor-crosshair hidden bg-transparent">
+                <div class="absolute bottom-4 left-1/2 -translate-x-1/2 bg-black/80 text-white px-4 py-2 rounded-full text-sm pointer-events-none shadow-lg border border-white/10 backdrop-blur">
+                    <i class="fas fa-crosshairs mr-2"></i>点击画面选择背景色
+                </div>
+            </div>
+
+            <!-- 导出时的全屏遮罩 -->
+            <div id="exportOverlay" class="absolute inset-0 z-[60] bg-black/90 flex flex-col items-center justify-center hidden">
+                <div class="text-center">
+                    <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
+                    <h2 class="text-xl font-bold text-white mb-2">正在处理并导出...</h2>
+                    <p class="text-sm text-gray-400 mb-4">请勿切换标签页或最小化浏览器</p>
+                    <div class="w-64 bg-gray-800 rounded-full h-2 overflow-hidden mx-auto">
+                        <div id="progressBar" class="bg-blue-500 h-full w-0 transition-all duration-300"></div>
+                    </div>
+                    <p id="progressText" class="text-xs text-gray-500 mt-2">0%</p>
+                </div>
+            </div>
+
+        </section>
+
+    </main>
+
+    <script>
+        // DOM 元素
+        const videoUpload = document.getElementById('videoUpload');
+        const sourceVideo = document.getElementById('sourceVideo');
+        const outputCanvas = document.getElementById('outputCanvas');
+        const emptyState = document.getElementById('emptyState');
+        const ctx = outputCanvas.getContext('2d', { willReadFrequently: true });
+        
+        // 渲染管线所需的离屏 Canvas
+        let maskCanvas = document.createElement('canvas');
+        let maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
+        
+        let videoBufferCanvas = document.createElement('canvas');
+        let videoBufferCtx = videoBufferCanvas.getContext('2d', { willReadFrequently: true });
+        
+        let blurBufferCanvas = document.createElement('canvas');
+        let blurBufferCtx = blurBufferCanvas.getContext('2d', { willReadFrequently: true });
+
+        // 控制元素
+        const keyColorInput = document.getElementById('keyColor');
+        const colorHexDisplay = document.getElementById('colorHex');
+        const colorPreview = document.getElementById('colorPreview');
+        const toleranceInput = document.getElementById('tolerance');
+        const toleranceVal = document.getElementById('toleranceVal');
+        const smoothingInput = document.getElementById('smoothing');
+        const smoothingVal = document.getElementById('smoothingVal');
+        const featherInput = document.getElementById('feather');
+        const featherVal = document.getElementById('featherVal');
+        const spillRemovalInput = document.getElementById('spillRemoval');
+        const showMaskInput = document.getElementById('showMask');
+        const pickColorBtn = document.getElementById('pickColorBtn');
+        const pickerOverlay = document.getElementById('pickerOverlay');
+        const bgModeRadios = document.querySelectorAll('input[name="bgMode"]');
+        const bgColorControl = document.getElementById('bgColorControl');
+        const bgColorInput = document.getElementById('bgColor');
+        const bgColorHex = document.getElementById('bgColorHex');
+        const playbackRateInput = document.getElementById('playbackRate');
+        const speedVal = document.getElementById('speedVal');
+        const resetSpeedBtn = document.getElementById('resetSpeedBtn');
+        const togglePlayBtn = document.getElementById('togglePlayBtn');
+        const exportBtn = document.getElementById('exportBtn');
+        const exportOverlay = document.getElementById('exportOverlay');
+        const progressBar = document.getElementById('progressBar');
+        const progressText = document.getElementById('progressText');
+        const resolutionDisplay = document.getElementById('resolutionDisplay');
+        const resText = document.getElementById('resText');
+        
+        // 导出格式与质量
+        const exportFormatRadios = document.querySelectorAll('input[name="exportFormat"]');
+        const hevcRadio = document.getElementById('hevcRadio');
+        const hevcLabel = document.getElementById('hevcLabel');
+        const hevcDesc = document.getElementById('hevcDesc');
+        const hevcWarning = document.getElementById('hevcWarning');
+        const hevcError = document.getElementById('hevcError');
+        const exportQualitySelect = document.getElementById('exportQuality');
+        const resolutionSelect = document.getElementById('resolutionSelect');
+
+        // 状态变量
+        let isProcessing = false;
+        let isExporting = false; 
+        let isPickingColor = false;
+        let animationFrameId;
+        let mediaRecorder;
+        let recordedChunks = [];
+        let exportFileExtension = 'webm';
+        let isHevcSupported = false;
+        
+        // 视频原生尺寸
+        let videoNativeWidth = 0;
+        let videoNativeHeight = 0;
+        
+        // 核心参数
+        let targetR = 0, targetG = 255, targetB = 0; 
+        let tolerance = 150; 
+        let smoothing = 20; 
+        let feather = 0;
+        let isSpillRemovalEnabled = true;
+        let isShowMask = false;
+        let isTransparentBg = true;
+        let bgR = 255, bgG = 255, bgB = 255;
+
+        // 初始化
+        updateColorState('#00ff00');
+        checkHevcSupport(); // 启动时检测
+
+        // --- 检测 HEVC 支持 ---
+        function checkHevcSupport() {
+            const types = [
+                'video/mp4; codecs=hvc1', 
+                'video/mp4; codecs=hev1',
+                'video/x-matroska; codecs=hvc1'
+            ];
+            
+            // 1. 优先使用标准 API 检测
+            isHevcSupported = types.some(t => {
+                try {
+                    return MediaRecorder.isTypeSupported(t);
+                } catch (e) {
+                    return false;
+                }
+            });
+            
+            // 2. 特殊处理 Safari
+            const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+            
+            if (isSafari) {
+                console.log("Safari detected, forcing HEVC support enabled.");
+                isHevcSupported = true;
+                hevcDesc.textContent = "H.265 (Safari原生)";
+                hevcDesc.classList.replace('text-gray-400', 'text-green-400');
+            }
+            
+            if (!isHevcSupported) {
+                hevcRadio.disabled = true;
+                hevcDesc.textContent = "(浏览器不支持)";
+                hevcDesc.classList.replace('text-gray-400', 'text-red-400');
+                if (hevcRadio.checked) {
+                    document.querySelector('input[value="webm"]').checked = true;
+                }
+            } else {
+                hevcRadio.disabled = false;
+                if (!isSafari) {
+                     hevcDesc.classList.replace('text-red-400', 'text-gray-400');
+                     hevcDesc.textContent = "H.265 Alpha";
+                }
+            }
+        }
+
+        // --- 更新画布尺寸 ---
+        function updateCanvasSize() {
+            if (!videoNativeWidth || !videoNativeHeight) return;
+
+            let targetW = videoNativeWidth;
+            let targetH = videoNativeHeight;
+            const option = resolutionSelect.value;
+
+            if (option !== 'original') {
+                const maxH = parseInt(option);
+                if (videoNativeHeight > maxH) {
+                    const ratio = videoNativeWidth / videoNativeHeight;
+                    targetH = maxH;
+                    targetW = Math.round(maxH * ratio);
+                }
+            }
+
+            // 更新所有 Canvas 尺寸
+            outputCanvas.width = targetW;
+            outputCanvas.height = targetH;
+            maskCanvas.width = targetW;
+            maskCanvas.height = targetH;
+            videoBufferCanvas.width = targetW;
+            videoBufferCanvas.height = targetH;
+            blurBufferCanvas.width = targetW;
+            blurBufferCanvas.height = targetH;
+
+            // 更新 UI 显示
+            resText.textContent = `${targetW}x${targetH}`;
+            resolutionDisplay.classList.remove('hidden');
+        }
+
+        // --- 事件监听 ---
+        videoUpload.addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            // 1. 清理旧资源
+            if (sourceVideo.src) {
+                URL.revokeObjectURL(sourceVideo.src);
+            }
+            // 停止旧循环
+            if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+                animationFrameId = null;
+            }
+            // 重置状态
+            isProcessing = false;
+            
+            const url = URL.createObjectURL(file);
+            sourceVideo.src = url;
+            
+            sourceVideo.onloadedmetadata = () => {
+                videoNativeWidth = sourceVideo.videoWidth;
+                videoNativeHeight = sourceVideo.videoHeight;
+                
+                // 根据当前选择设置画布尺寸
+                updateCanvasSize();
+                
+                emptyState.classList.add('hidden');
+                outputCanvas.classList.remove('hidden');
+                togglePlayBtn.disabled = false;
+                exportBtn.disabled = false;
+                
+                sourceVideo.playbackRate = parseFloat(playbackRateInput.value);
+                sourceVideo.loop = true; 
+                sourceVideo.play().then(() => {
+                    updatePlayButtonIcon(true);
+                    // 强制开启新的处理循环
+                    startProcessing();
+                }).catch(err => console.error("Auto-play failed:", err));
+            };
+        });
+
+        // 监听分辨率变化
+        resolutionSelect.addEventListener('change', () => {
+            updateCanvasSize();
+        });
+
+        keyColorInput.addEventListener('input', (e) => updateColorState(e.target.value));
+        toleranceInput.addEventListener('input', (e) => { tolerance = parseInt(e.target.value); toleranceVal.textContent = tolerance; });
+        smoothingInput.addEventListener('input', (e) => { smoothing = parseInt(e.target.value); smoothingVal.textContent = smoothing; });
+        featherInput.addEventListener('input', (e) => { 
+            feather = parseFloat(e.target.value); 
+            featherVal.textContent = feather + 'px'; 
+        });
+        spillRemovalInput.addEventListener('change', (e) => { isSpillRemovalEnabled = e.target.checked; });
+        showMaskInput.addEventListener('change', (e) => { isShowMask = e.target.checked; });
+
+        bgModeRadios.forEach(radio => {
+            radio.addEventListener('change', (e) => {
+                if (e.target.value === 'transparent') {
+                    isTransparentBg = true;
+                    bgColorControl.classList.add('hidden');
+                } else {
+                    isTransparentBg = false;
+                    bgColorControl.classList.remove('hidden');
+                }
+            });
+        });
+        
+        exportFormatRadios.forEach(radio => {
+            radio.addEventListener('change', (e) => {
+                hevcWarning.classList.add('hidden');
+                hevcError.classList.add('hidden');
+                if (e.target.value === 'hevc') {
+                    if (isHevcSupported) {
+                        hevcWarning.classList.remove('hidden');
+                    } else {
+                        hevcError.classList.remove('hidden');
+                    }
+                }
+            });
+        });
+
+        bgColorInput.addEventListener('input', (e) => {
+            const hex = e.target.value;
+            bgColorHex.textContent = hex.toUpperCase();
+            const rgb = hexToRgb(hex);
+            bgR = rgb.r; bgG = rgb.g; bgB = rgb.b;
+        });
+
+        playbackRateInput.addEventListener('input', (e) => {
+            const rate = parseFloat(e.target.value);
+            sourceVideo.playbackRate = rate;
+            speedVal.textContent = rate + 'x';
+        });
+        resetSpeedBtn.addEventListener('click', () => {
+            playbackRateInput.value = 1.0;
+            sourceVideo.playbackRate = 1.0;
+            speedVal.textContent = '1.0x';
+        });
+
+        pickColorBtn.addEventListener('click', () => {
+            isPickingColor = true;
+            pickerOverlay.classList.remove('hidden');
+        });
+
+        pickerOverlay.addEventListener('click', (e) => {
+            if (!isPickingColor) return;
+            const rect = outputCanvas.getBoundingClientRect();
+            // 注意：取色时坐标映射也需要基于当前 Canvas 实际尺寸
+            const displayedWidth = outputCanvas.offsetWidth;
+            const displayedHeight = outputCanvas.offsetHeight;
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+            const x = (mouseX / displayedWidth) * outputCanvas.width;
+            const y = (mouseY / displayedHeight) * outputCanvas.height;
+
+            videoBufferCtx.drawImage(sourceVideo, 0, 0, videoBufferCanvas.width, videoBufferCanvas.height);
+            const pixel = videoBufferCtx.getImageData(x, y, 1, 1).data;
+            updateColorState(rgbToHex(pixel[0], pixel[1], pixel[2]));
+            isPickingColor = false;
+            pickerOverlay.classList.add('hidden');
+        });
+
+        togglePlayBtn.addEventListener('click', () => {
+            if (sourceVideo.paused) { 
+                sourceVideo.play(); 
+                updatePlayButtonIcon(true);
+                startProcessing(); 
+            } else { 
+                sourceVideo.pause(); 
+                updatePlayButtonIcon(false); 
+            }
+        });
+
+        exportBtn.addEventListener('click', startExportProcess);
+
+        // --- 核心逻辑 ---
+
+        function updatePlayButtonIcon(isPlaying) {
+            togglePlayBtn.innerHTML = isPlaying ? '<i class="fas fa-pause mr-1"></i> 暂停' : '<i class="fas fa-play mr-1"></i> 播放';
+        }
+
+        function updateColorState(hex) {
+            keyColorInput.value = hex;
+            colorHexDisplay.textContent = hex.toUpperCase();
+            colorPreview.style.backgroundColor = hex;
+            const rgb = hexToRgb(hex);
+            targetR = rgb.r; targetG = rgb.g; targetB = rgb.b;
+        }
+
+        function startProcessing() {
+            if (isProcessing) return;
+            isProcessing = true;
+            processFrame();
+        }
+
+        function processFrame() {
+            if ((!sourceVideo.paused && !sourceVideo.ended) || isExporting) {
+                animationFrameId = requestAnimationFrame(processFrame);
+            } else {
+                isProcessing = false; 
+                animationFrameId = null;
+            }
+
+            if (isExporting) {
+                const percent = Math.min(100, Math.floor((sourceVideo.currentTime / sourceVideo.duration) * 100));
+                progressBar.style.width = `${percent}%`;
+                progressText.textContent = `${percent}%`;
+            }
+
+            if (sourceVideo.readyState >= sourceVideo.HAVE_CURRENT_DATA) {
+                const w = outputCanvas.width;
+                const h = outputCanvas.height;
+
+                // 1. 获取原视频数据
+                videoBufferCtx.drawImage(sourceVideo, 0, 0, w, h);
+                const frame = videoBufferCtx.getImageData(0, 0, w, h);
+                const l = frame.data.length / 4;
+
+                const maskImgData = maskCtx.createImageData(w, h);
+
+                for (let i = 0; i < l; i++) {
+                    let r = frame.data[i * 4 + 0];
+                    let g = frame.data[i * 4 + 1];
+                    let b = frame.data[i * 4 + 2];
+                    
+                    const dist = Math.sqrt(
+                        2 * (r - targetR) ** 2 + 
+                        4 * (g - targetG) ** 2 + 
+                        3 * (b - targetB) ** 2
+                    );
+
+                    let alphaVal = 1.0;
+                    if (dist < tolerance) {
+                        alphaVal = 0.0;
+                    } else if (dist < tolerance + smoothing) {
+                        alphaVal = (dist - tolerance) / smoothing;
+                    }
+
+                    // Despill
+                    if (isSpillRemovalEnabled) {
+                        if (targetG > targetR && targetG > targetB) {
+                            const limit = Math.max(r, b);
+                            if (g > limit) { g = (g + limit) / 2; frame.data[i * 4 + 1] = g; }
+                        } else if (targetB > targetR && targetB > targetG) {
+                            const limit = Math.max(r, g);
+                            if (b > limit) { b = (b + limit) / 2; frame.data[i * 4 + 2] = b; }
+                        }
+                    }
+
+                    // Mask 生成
+                    maskImgData.data[i * 4 + 0] = 255;
+                    maskImgData.data[i * 4 + 1] = 255;
+                    maskImgData.data[i * 4 + 2] = 255;
+                    maskImgData.data[i * 4 + 3] = alphaVal * 255; 
+                }
+                
+                videoBufferCtx.putImageData(frame, 0, 0);
+                maskCtx.putImageData(maskImgData, 0, 0);
+
+                // 2. 模糊处理
+                blurBufferCtx.clearRect(0, 0, w, h);
+                if (feather > 0) {
+                    blurBufferCtx.filter = `blur(${feather}px)`;
+                } else {
+                    blurBufferCtx.filter = 'none';
+                }
+                blurBufferCtx.drawImage(maskCanvas, 0, 0);
+                blurBufferCtx.filter = 'none';
+
+                // 3. 最终合成
+                ctx.clearRect(0, 0, w, h);
+                if (isShowMask) {
+                    ctx.fillStyle = 'black';
+                    ctx.fillRect(0, 0, w, h);
+                    ctx.drawImage(blurBufferCanvas, 0, 0);
+                } else {
+                    ctx.globalCompositeOperation = 'source-over';
+                    ctx.drawImage(videoBufferCanvas, 0, 0);
+                    
+                    ctx.globalCompositeOperation = 'destination-in';
+                    ctx.drawImage(blurBufferCanvas, 0, 0);
+                    
+                    if (!isTransparentBg) {
+                        ctx.globalCompositeOperation = 'destination-over';
+                        ctx.fillStyle = `rgb(${bgR}, ${bgG}, ${bgB})`;
+                        ctx.fillRect(0, 0, w, h);
+                    }
+                    ctx.globalCompositeOperation = 'source-over';
+                }
+            }
+        }
+
+        // --- 核心：自动导出流程 ---
+        
+        function startExportProcess() {
+            if (isExporting) return;
+            
+            isExporting = true;
+            exportOverlay.classList.remove('hidden');
+            progressBar.style.width = '0%';
+            progressText.textContent = '准备中...';
+            
+            sourceVideo.pause();
+            sourceVideo.currentTime = 0;
+            sourceVideo.loop = false;
+            
+            const currentSpeed = parseFloat(playbackRateInput.value);
+            sourceVideo.playbackRate = currentSpeed;
+            
+            recordedChunks = [];
+            let stream;
+            
+            try {
+                // 使用当前设置的 outputCanvas 分辨率进行录制
+                // 获取用户选择的 fps, 默认为 30
+                stream = outputCanvas.captureStream(30);
+                
+                if (sourceVideo.captureStream) {
+                    const videoStream = sourceVideo.captureStream();
+                    const audioTracks = videoStream.getAudioTracks();
+                    if (audioTracks.length > 0) {
+                        stream.addTrack(audioTracks[0]);
+                    }
+                } else if (sourceVideo.mozCaptureStream) {
+                     const videoStream = sourceVideo.mozCaptureStream();
+                     const audioTracks = videoStream.getAudioTracks();
+                     if (audioTracks.length > 0) {
+                        stream.addTrack(audioTracks[0]);
+                     }
+                }
+            } catch (e) {
+                console.warn("Audio capture failed", e);
+                stream = outputCanvas.captureStream(30);
+            }
+
+            const exportFormat = document.querySelector('input[name="exportFormat"]:checked').value;
+            const exportBitrate = parseInt(exportQualitySelect.value);
+            
+            let mimeTypes = [];
+            
+            if (exportFormat === 'hevc') {
+                mimeTypes = [
+                    'video/mp4; codecs=hvc1', 
+                    'video/mp4; codecs=hev1',
+                    'video/mp4', 
+                    'video/x-matroska; codecs=hvc1'
+                ];
+                exportFileExtension = 'mp4';
+            } else {
+                mimeTypes = [
+                    'video/webm; codecs=vp9',
+                    'video/webm; codecs=vp8',
+                    'video/webm'
+                ];
+                exportFileExtension = 'webm';
+            }
+
+            let selectedMimeType = '';
+            for (const type of mimeTypes) {
+                if (MediaRecorder.isTypeSupported(type)) {
+                    selectedMimeType = type;
+                    console.log("Selected MIME:", selectedMimeType);
+                    break;
+                }
+            }
+            
+            if (!selectedMimeType && exportFormat === 'hevc') {
+                 const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+                 if (isSafari && MediaRecorder.isTypeSupported('video/mp4')) {
+                     selectedMimeType = 'video/mp4';
+                     console.log("Force fallback to generic video/mp4 for Safari");
+                 }
+            }
+            
+            if (!selectedMimeType) {
+                if (exportFormat === 'hevc') {
+                    console.warn("HEVC not supported, falling back to WebM");
+                    alert('当前浏览器不支持HEVC录制，将自动回退到WebM格式。');
+                    selectedMimeType = 'video/webm; codecs=vp9';
+                    if (!MediaRecorder.isTypeSupported(selectedMimeType)) {
+                        selectedMimeType = 'video/webm';
+                    }
+                    exportFileExtension = 'webm';
+                } else {
+                    alert('您的浏览器不支持 WebM 录制。请使用 Chrome。');
+                    cancelExport();
+                    return;
+                }
+            }
+
+            mediaRecorder = new MediaRecorder(stream, { 
+                mimeType: selectedMimeType, 
+                videoBitsPerSecond: exportBitrate // 使用用户选择的比特率
+            });
+
+            mediaRecorder.ondataavailable = (event) => { 
+                if (event.data.size > 0) recordedChunks.push(event.data); 
+            };
+
+            mediaRecorder.onstop = saveVideo;
+
+            sourceVideo.onended = () => {
+                console.log("Video ended, stopping recording");
+                mediaRecorder.stop();
+                finishExport();
+            };
+
+            mediaRecorder.start();
+            sourceVideo.play().then(() => {
+                progressText.textContent = '导出中...';
+            }).catch(e => {
+                alert("无法自动播放视频，导出失败。请重试。");
+                cancelExport();
+            });
+            
+            // 确保导出开始时循环正在运行
+            if (!animationFrameId) startProcessing();
+        }
+        
+        function cancelExport() {
+            isExporting = false;
+            exportOverlay.classList.add('hidden');
+            sourceVideo.loop = true;
+            sourceVideo.onended = null;
+        }
+
+        function finishExport() {
+            isExporting = false;
+            exportOverlay.classList.add('hidden');
+            sourceVideo.loop = true;
+            sourceVideo.onended = null;
+            sourceVideo.play();
+        }
+
+        function saveVideo() {
+            const options = { type: recordedChunks[0].type };
+            const blob = new Blob(recordedChunks, options);
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            document.body.appendChild(a);
+            a.style = 'display: none';
+            a.href = url;
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            a.download = `chromakey-export-${timestamp}.${exportFileExtension}`;
+            a.click();
+            window.URL.revokeObjectURL(url);
+            console.log("Export saved as", exportFileExtension);
+        }
+
+        function hexToRgb(hex) {
+            const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+            return result ? { r: parseInt(result[1], 16), g: parseInt(result[2], 16), b: parseInt(result[3], 16) } : { r: 0, g: 255, b: 0 };
+        }
+        function rgbToHex(r, g, b) {
+            return "#" + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
+        }
+    </script>
+</body>
+</html>
