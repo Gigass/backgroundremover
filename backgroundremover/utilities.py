@@ -1,5 +1,6 @@
 import os
 import math
+from fractions import Fraction
 import torch.multiprocessing as multiprocessing
 import subprocess as sp
 import time
@@ -12,6 +13,43 @@ import requests
 from pathlib import Path
 
 multiprocessing.set_start_method('spawn', force=True)
+
+
+def _parse_frame_rate(rate_str):
+    try:
+        return float(Fraction(rate_str))
+    except Exception:
+        return float(rate_str)
+
+
+def _alpha_encoding_args(output, alpha_codec, alpha_pix_fmt):
+    ext = Path(output).suffix.lower()
+    if alpha_codec in (None, "auto"):
+        if ext == ".webm":
+            alpha_codec = "libvpx-vp9"
+        else:
+            alpha_codec = "qtrle"
+
+    if alpha_codec == "prores_ks":
+        args = ["-c:v", "prores_ks", "-profile:v", "4"]
+        pix_fmt = alpha_pix_fmt or "yuva444p10le"
+        args += ["-pix_fmt", pix_fmt]
+        return args
+
+    if alpha_codec == "libvpx-vp9":
+        args = ["-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0"]
+        pix_fmt = alpha_pix_fmt or "yuva420p"
+        args += ["-pix_fmt", pix_fmt]
+        return args
+
+    if alpha_codec == "qtrle":
+        pix_fmt = alpha_pix_fmt or "argb"
+        return ["-c:v", "qtrle", "-pix_fmt", pix_fmt]
+
+    args = ["-c:v", alpha_codec]
+    if alpha_pix_fmt:
+        args += ["-pix_fmt", alpha_pix_fmt]
+    return args
 
 
 def worker(worker_nodes,
@@ -104,9 +142,13 @@ def matte_key(output, file_path,
 
     if framerate == -1:
         print(F"FRAME RATE DETECTED: {frame_rate_str} (if this looks wrong, override the frame rate)")
-        framerate = math.ceil(eval(frame_rate_str))
+        framerate_str = frame_rate_str
+        framerate_value = _parse_frame_rate(frame_rate_str)
+    else:
+        framerate_str = str(framerate)
+        framerate_value = float(framerate)
 
-    print(F"FRAME RATE: {framerate} TOTAL FRAMES: {total_frames}")
+    print(F"FRAME RATE: {framerate_value} TOTAL FRAMES: {total_frames}")
 
     p = multiprocessing.Process(target=capture_frames,
                                 args=(file_path, frames_dict, gpu_batchsize * prefetched_batches, total_frames))
@@ -129,10 +171,29 @@ def matte_key(output, file_path,
 
             hash_index = i * worker_nodes + 1 + wx
 
-            while hash_index not in results_dict:
-                time.sleep(0.1)
+            try:
+                timeout_counter = 0
+                while hash_index not in results_dict:
+                    time.sleep(0.1)
+                    timeout_counter += 1
+                    # Check if workers are still alive every 10 seconds
+                    if timeout_counter % 100 == 0:
+                        dead_workers = [w for w in workers if not w.is_alive()]
+                        if dead_workers and hash_index not in results_dict:
+                            raise RuntimeError(f"Worker process crashed while waiting for frame batch {hash_index}. Try reducing worker count with -wn 1")
 
-            frames = results_dict[hash_index]
+                frames = results_dict[hash_index]
+            except (ConnectionResetError, BrokenPipeError) as e:
+                print(f"\nError: Worker connection lost (frame batch {hash_index}). This often happens with high worker counts.")
+                print("Try reducing workers with -wn 1 or -wn 2")
+                # Clean up
+                p.terminate()
+                for w in workers:
+                    w.terminate()
+                if proc:
+                    proc.stdin.close()
+                    proc.wait()
+                raise RuntimeError(f"Worker connection error: {e}")
             # dont block access to it anymore
             del results_dict[hash_index]
 
@@ -144,7 +205,7 @@ def matte_key(output, file_path,
                                '-vcodec', 'rawvideo',
                                '-s', F"{frame.shape[1]}x320",
                                '-pix_fmt', 'gray',
-                               '-r', F"{framerate}",
+                               '-r', framerate_str,
                                '-i', '-',
                                '-an',
                                '-vcodec', 'mpeg4',
@@ -192,7 +253,7 @@ def transparentgif(output, file_path,
               framerate)
     cmd = [
         'ffmpeg', '-y', '-i', file_path, '-i', temp_file, '-filter_complex',
-        '[1][0]scale2ref[mask][main];[main][mask]alphamerge=shortest=1,fps=10,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse',
+        '[1][0]scale2ref[mask][main];[main][mask]alphamerge,fps=10,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse',
         '-shortest', output
     ]
 
@@ -223,7 +284,7 @@ def transparentgifwithbackground(output, overlay, file_path,
     print("Starting alphamerge")
     cmd = [
         'ffmpeg', '-y', '-i', file_path, '-i', temp_file, '-i', overlay, '-filter_complex',
-        '[1][0]scale2ref[mask][main];[main][mask]alphamerge=shortest=1[fg];[2][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2:format=auto,fps=10,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse',
+        '[1][0]scale2ref[mask][main];[main][mask]alphamerge[fg];[2][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2:format=auto,fps=10,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse',
         '-shortest', output
     ]
     sp.run(cmd)
@@ -241,7 +302,9 @@ def transparentvideo(output, file_path,
                      model_name,
                      frame_limit=-1,
                      prefetched_batches=4,
-                     framerate=-1):
+                     framerate=-1,
+                     alpha_codec="auto",
+                     alpha_pix_fmt=None):
     temp_dir = tempfile.TemporaryDirectory()
     tmpdirname = Path(temp_dir.name)
     temp_file = os.path.abspath(os.path.join(tmpdirname, "matte.mp4"))
@@ -253,10 +316,13 @@ def transparentvideo(output, file_path,
               prefetched_batches,
               framerate)
     print("Starting alphamerge")
+    encoding_args = _alpha_encoding_args(output, alpha_codec, alpha_pix_fmt)
     cmd = [
         'ffmpeg', '-y', '-i', file_path, '-i', temp_file, '-filter_complex',
-        '[1][0]scale2ref[mask][main];[main][mask]alphamerge=shortest=1', '-c:v', 'qtrle', '-shortest', output
+        '[1][0]scale2ref[mask][main];[main][mask]alphamerge[v]',
+        '-map', '[v]', '-map', '0:a?', '-shortest'
     ]
+    cmd += encoding_args + [output]
 
     sp.run(cmd)
     print("Process finished")
@@ -273,7 +339,9 @@ def transparentvideoovervideo(output, overlay, file_path,
                          model_name,
                          frame_limit=-1,
                          prefetched_batches=4,
-                         framerate=-1):
+                         framerate=-1,
+                         alpha_codec="auto",
+                         alpha_pix_fmt=None):
     temp_dir = tempfile.TemporaryDirectory()
     tmpdirname = Path(temp_dir.name)
     temp_file = os.path.abspath(os.path.join(tmpdirname, "matte.mp4"))
@@ -285,10 +353,13 @@ def transparentvideoovervideo(output, overlay, file_path,
               prefetched_batches,
               framerate)
     print("Starting alphamerge")
+    encoding_args = _alpha_encoding_args(output, alpha_codec, alpha_pix_fmt)
     cmd = [
         'ffmpeg', '-y', '-i', file_path, '-i', temp_file, '-i', overlay, '-filter_complex',
-        '[1][0]scale2ref[mask][main];[main][mask]alphamerge=shortest=1[vid];[vid][2:v]scale2ref[fg][bg];[bg][fg]overlay=shortest=1[out]', '-map', '[out]', '-shortest', output
+        '[1][0]scale2ref[mask][main];[main][mask]alphamerge[vid];[vid][2:v]scale2ref[fg][bg];[bg][fg]overlay[out]',
+        '-map', '[out]', '-map', '2:a?', '-shortest'
     ]
+    cmd += encoding_args + [output]
     sp.run(cmd)
     print("Process finished")
     try:
@@ -304,7 +375,9 @@ def transparentvideooverimage(output, overlay, file_path,
                          model_name,
                          frame_limit=-1,
                          prefetched_batches=4,
-                         framerate=-1):
+                         framerate=-1,
+                         alpha_codec="auto",
+                         alpha_pix_fmt=None):
     temp_dir = tempfile.TemporaryDirectory()
     tmpdirname = Path(temp_dir.name)
     temp_file = os.path.abspath(os.path.join(tmpdirname, "matte.mp4"))
@@ -323,11 +396,13 @@ def transparentvideooverimage(output, overlay, file_path,
     ]
     sp.run(cmd)
     print("Starting alphamerge")
+    encoding_args = _alpha_encoding_args(output, alpha_codec, alpha_pix_fmt)
     cmd = [
         'ffmpeg', '-y', '-i', temp_image, '-i', file_path, '-i', temp_file, '-filter_complex',
-        '[0:v]scale2ref=oh*mdar:ih[bg];[1:v]scale2ref=oh*mdar:ih[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1[out]',
-        '-map', '[out]', '-shortest', output
+        '[2][1]scale2ref[mask][main];[main][mask]alphamerge[fg];[0:v]scale2ref[bg][fg];[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1[out]',
+        '-map', '[out]', '-map', '1:a?', '-shortest'
     ]
+    cmd += encoding_args + [output]
     sp.run(cmd)
     print("Process finished")
     try:
