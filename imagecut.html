@@ -44,8 +44,46 @@
             };
         }
 
-        function onOpenCvScriptError() {
-            markCvState('failed', 'OpenCV 脚本加载失败');
+        function onOpenCvScriptError(errorMessage = 'OpenCV 脚本加载失败') {
+            markCvState('failed', errorMessage);
+        }
+
+        function loadSingleOpenCvScript(src, timeoutMs = 15000) {
+            return new Promise(resolve => {
+                const script = document.createElement('script');
+                let done = false;
+                const finish = (ok) => {
+                    if (done) return;
+                    done = true;
+                    clearTimeout(timer);
+                    script.onload = null;
+                    script.onerror = null;
+                    resolve(ok);
+                };
+                const timer = setTimeout(() => finish(false), timeoutMs);
+                script.async = true;
+                script.src = src;
+                script.crossOrigin = 'anonymous';
+                script.onload = () => {
+                    onOpenCvScriptLoad();
+                    finish(true);
+                };
+                script.onerror = () => finish(false);
+                document.head.appendChild(script);
+            });
+        }
+
+        async function loadOpenCvWithFallback() {
+            const candidates = [
+                'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.12.0-release.1/dist/opencv.js',
+                'https://unpkg.com/@techstark/opencv-js@4.12.0-release.1/dist/opencv.js'
+            ];
+
+            for (const src of candidates) {
+                const ok = await loadSingleOpenCvScript(src);
+                if (ok) return;
+            }
+            onOpenCvScriptError('OpenCV 所有 CDN 均加载失败');
         }
 
         window.__waitForCv = function(timeoutMs = 7000) {
@@ -57,8 +95,9 @@
             const timeoutPromise = new Promise(resolve => setTimeout(() => resolve(false), timeoutMs));
             return Promise.race([window.__cvReadyPromise, timeoutPromise]);
         };
+
+        loadOpenCvWithFallback();
     </script>
-    <script async src="https://docs.opencv.org/4.10.0/opencv.js" onload="onOpenCvScriptLoad()" onerror="onOpenCvScriptError()"></script>
     
     <style>
         body {
@@ -179,7 +218,7 @@
                 </svg>
                 选择图片
             </button>
-            <input type="file" id="fileInput" accept="image/*" class="hidden">
+            <input type="file" id="fileInput" accept="image/*" multiple class="hidden">
         </div>
     </header>
 
@@ -202,6 +241,13 @@
                 </div>
                 <div id="watermarkStatus" class="text-xs text-gray-400 bg-gray-800 p-2 rounded leading-relaxed">
                     状态：等待导入图片
+                </div>
+                <div id="batchInfo" class="text-xs text-gray-400 bg-gray-800 p-2 rounded leading-relaxed">
+                    批量：0 张（未导入）
+                </div>
+                <div class="grid grid-cols-2 gap-2">
+                    <button id="prevImageBtn" class="bg-gray-700 hover:bg-gray-600 text-xs py-2 rounded disabled:opacity-50 disabled:cursor-not-allowed" disabled>上一张</button>
+                    <button id="nextImageBtn" class="bg-gray-700 hover:bg-gray-600 text-xs py-2 rounded disabled:opacity-50 disabled:cursor-not-allowed" disabled>下一张</button>
                 </div>
                 <div class="text-[11px] text-gray-500">
                     仅处理你有权编辑的图片；检测置信度低时会启用右下角修复兜底。
@@ -294,6 +340,9 @@
                     </svg>
                     开始裁切
                 </button>
+                <button id="batchSliceBtn" onclick="generateBatchSlicesZip()" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-2.5 rounded-lg font-semibold shadow transition disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                    批量裁切并下载 ZIP
+                </button>
             </div>
         </aside>
 
@@ -348,7 +397,16 @@
         let activeImageLoadToken = 0; // 防止并发导入覆盖
         let isCleanupRunning = false;
         let cleanupJobId = 0;
+        let isBatchGenerating = false;
+        let batchItems = [];
+        let currentBatchIndex = -1;
+        let nanoAlphaMapsCache = null;
+        let nanoAlphaLoadPromise = null;
         const WATERMARK_STATUS_CLASSES = ['text-gray-400', 'text-blue-400', 'text-green-400', 'text-yellow-400', 'text-red-400'];
+        const NANO_ALPHA_SOURCE_URLS = [
+            'https://raw.githubusercontent.com/nicholasxdavis/remove-gemini-watermark/main/js/watermark-remover.js',
+            'https://raw.githubusercontent.com/fekilooo/Gemini-NanoBanana-Watermark-Remover/main/content.js'
+        ];
         
         // 裁切框状态 (相对于原始图片尺寸)
         let cropState = {
@@ -373,6 +431,8 @@
         fileInput.addEventListener('change', handleFileSelect);
         document.getElementById('rerunCleanupBtn').addEventListener('click', rerunWatermarkCleanup);
         document.getElementById('restoreOriginalBtn').addEventListener('click', restoreSourceImage);
+        document.getElementById('prevImageBtn').addEventListener('click', showPrevImage);
+        document.getElementById('nextImageBtn').addEventListener('click', showNextImage);
         document.getElementById('autoWatermarkToggle').addEventListener('change', () => {
             const isEnabled = document.getElementById('autoWatermarkToggle').checked;
             setWatermarkStatus(
@@ -441,10 +501,109 @@
             statusEl.innerText = `状态：${message}`;
         }
 
+        function getCurrentBatchItem() {
+            if (currentBatchIndex < 0 || currentBatchIndex >= batchItems.length) return null;
+            return batchItems[currentBatchIndex];
+        }
+
+        function getSafeStem(name, fallback = 'image') {
+            const stem = (name || fallback).replace(/\.[^.]+$/, '');
+            return stem.replace(/[^a-zA-Z0-9_\-]+/g, '_').replace(/^_+|_+$/g, '') || fallback;
+        }
+
+        function updateBatchInfo() {
+            const total = batchItems.length;
+            const batchInfoEl = document.getElementById('batchInfo');
+            if (!batchInfoEl) return;
+            if (total === 0 || currentBatchIndex < 0) {
+                batchInfoEl.innerText = '批量：0 张（未导入）';
+                return;
+            }
+            const item = getCurrentBatchItem();
+            const name = item ? item.name : '未命名';
+            batchInfoEl.innerText = `批量：${currentBatchIndex + 1}/${total}（${name}）`;
+        }
+
         function updateCleanupButtonsState() {
-            const hasImage = !!sourceImage;
-            document.getElementById('rerunCleanupBtn').disabled = !hasImage || isCleanupRunning;
-            document.getElementById('restoreOriginalBtn').disabled = !hasImage || isCleanupRunning;
+            const hasImage = batchItems.length > 0 && currentBatchIndex >= 0;
+            const isBusy = isCleanupRunning || isBatchGenerating;
+
+            document.getElementById('rerunCleanupBtn').disabled = !hasImage || isBusy;
+            document.getElementById('restoreOriginalBtn').disabled = !hasImage || isBusy;
+            document.getElementById('batchSliceBtn').disabled = !hasImage || batchItems.length < 2 || isBusy;
+
+            const prevBtn = document.getElementById('prevImageBtn');
+            const nextBtn = document.getElementById('nextImageBtn');
+            prevBtn.disabled = !hasImage || isBusy || currentBatchIndex <= 0;
+            nextBtn.disabled = !hasImage || isBusy || currentBatchIndex >= batchItems.length - 1;
+
+            updateBatchInfo();
+        }
+
+        function showCleanupStatusForCurrentItem() {
+            const item = getCurrentBatchItem();
+            if (!item) {
+                setWatermarkStatus('等待导入图片', 'neutral');
+                return;
+            }
+            const method = item.cleanupMeta?.method || 'none';
+            const score = Math.round((item.cleanupMeta?.score || 0) * 100);
+            if (method === 'reverse-alpha') {
+                setWatermarkStatus(`当前图：已反向去印（置信度 ${score}%）`, 'success');
+            } else if (method === 'inpaint-template') {
+                setWatermarkStatus(`当前图：已去水印（模板置信度 ${score}%）`, 'success');
+            } else if (method === 'no-watermark') {
+                setWatermarkStatus('当前图：未检测到稳定水印，保留原图', 'neutral');
+            } else if (method === 'reverse-unstable') {
+                setWatermarkStatus('当前图：检测到反向恢复异常，已保留原图', 'warn');
+            } else if (method === 'reverse-low-confidence') {
+                setWatermarkStatus(`当前图：低置信度（${score}%），保留原图`, 'neutral');
+            } else if (method === 'cleanup-unavailable') {
+                setWatermarkStatus('当前图：去印引擎不可用，保留原图', 'warn');
+            } else if (method === 'inpaint-low-confidence') {
+                setWatermarkStatus('当前图：模板置信度不足，保留原图', 'neutral');
+            } else if (method === 'inpaint-error') {
+                setWatermarkStatus('当前图：inpaint 出错，保留原图', 'warn');
+            } else if (method === 'inpaint-unavailable') {
+                setWatermarkStatus('当前图：inpaint 不可用，保留原图', 'warn');
+            } else if (method === 'reverse-unavailable') {
+                setWatermarkStatus('当前图：反向去印不可用，保留原图', 'warn');
+            } else if (method === 'patch-fallback') {
+                setWatermarkStatus('当前图：使用了旧版纹理兜底结果', 'warn');
+            } else if (method === 'restored') {
+                setWatermarkStatus('当前图：已手动恢复原图', 'neutral');
+            } else if (method === 'original') {
+                setWatermarkStatus('当前图：使用原图（未去水印）', 'neutral');
+            } else {
+                setWatermarkStatus('当前图：已导入', 'neutral');
+            }
+        }
+
+        function switchToBatchItem(index, options = {}) {
+            if (index < 0 || index >= batchItems.length) return;
+            const normalizedCrop = options.keepCrop ? getNormalizedCropSnapshot() : null;
+            currentBatchIndex = index;
+            const item = batchItems[index];
+            sourceImage = item.sourceImage || null;
+            const imageToShow = item.processedImage || item.sourceImage;
+            if (imageToShow) {
+                applyImageToEditor(imageToShow, { keepCrop: !!options.keepCrop });
+                if (normalizedCrop) {
+                    applyNormalizedCropSnapshot(normalizedCrop);
+                }
+            }
+            showCleanupStatusForCurrentItem();
+            updateCleanupButtonsState();
+        }
+
+        function showPrevImage() {
+            if (isCleanupRunning || isBatchGenerating) return;
+            if (currentBatchIndex > 0) switchToBatchItem(currentBatchIndex - 1, { keepCrop: true });
+        }
+
+        function showNextImage() {
+            if (isCleanupRunning || isBatchGenerating) return;
+            if (currentBatchIndex < batchItems.length - 1) switchToBatchItem(currentBatchIndex + 1, { keepCrop: true });
         }
 
         function createImageFromDataUrl(dataUrl) {
@@ -456,12 +615,58 @@
             });
         }
 
+        function readFileAsDataUrl(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = e => resolve(e.target.result);
+                reader.onerror = () => reject(new Error(`读取文件失败：${file.name || 'unknown'}`));
+                reader.readAsDataURL(file);
+            });
+        }
+
+        function resetBatchCollection() {
+            batchItems = [];
+            currentBatchIndex = -1;
+            sourceImage = null;
+            originalImage = null;
+            generatedBlobs = [];
+            cropState.x = 0;
+            cropState.y = 0;
+            cropState.w = 0;
+            cropState.h = 0;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            document.getElementById('empty-state').style.display = 'block';
+            updateCleanupButtonsState();
+        }
+
         function normalizeCropStateWithinImage() {
             if (!originalImage) return;
             cropState.w = clamp(cropState.w, 10, originalImage.width);
             cropState.h = clamp(cropState.h, 10, originalImage.height);
             cropState.x = clamp(cropState.x, 0, originalImage.width - cropState.w);
             cropState.y = clamp(cropState.y, 0, originalImage.height - cropState.h);
+        }
+
+        function getNormalizedCropSnapshot() {
+            if (!originalImage || originalImage.width <= 0 || originalImage.height <= 0) {
+                return { x: 0, y: 0, w: 1, h: 1 };
+            }
+            return {
+                x: clamp(cropState.x / originalImage.width, 0, 1),
+                y: clamp(cropState.y / originalImage.height, 0, 1),
+                w: clamp(cropState.w / originalImage.width, 0.01, 1),
+                h: clamp(cropState.h / originalImage.height, 0.01, 1)
+            };
+        }
+
+        function applyNormalizedCropSnapshot(norm) {
+            if (!originalImage || !norm) return;
+            cropState.x = clamp(Math.round(norm.x * originalImage.width), 0, Math.max(0, originalImage.width - 1));
+            cropState.y = clamp(Math.round(norm.y * originalImage.height), 0, Math.max(0, originalImage.height - 1));
+            cropState.w = clamp(Math.round(norm.w * originalImage.width), 1, originalImage.width - cropState.x);
+            cropState.h = clamp(Math.round(norm.h * originalImage.height), 1, originalImage.height - cropState.y);
+            updateInputsFromCrop();
+            drawCanvas();
         }
 
         function applyImageToEditor(image, options = {}) {
@@ -493,6 +698,564 @@
                 updateInputsFromCrop();
                 drawCanvas();
             }
+        }
+
+        async function fetchTextWithTimeout(url, timeoutMs = 12000) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const res = await fetch(url, {
+                    signal: controller.signal,
+                    cache: 'force-cache'
+                });
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
+                return await res.text();
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+
+        function extractDataUrlFromScript(source, varNames) {
+            for (const varName of varNames) {
+                const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const regex = new RegExp(
+                    `(?:const|var|let)\\s+${escaped}\\s*=\\s*([\"'\\\`])(data:image\\/png;base64,[^\"'\\\`]+)\\1`
+                );
+                const match = source.match(regex);
+                if (match && match[2]) {
+                    return match[2];
+                }
+            }
+            return null;
+        }
+
+        async function buildAlphaMapFromDataUrl(dataUrl, size) {
+            const img = await createImageFromDataUrl(dataUrl);
+            const workCanvas = document.createElement('canvas');
+            workCanvas.width = size;
+            workCanvas.height = size;
+            const workCtx = workCanvas.getContext('2d');
+            if (!workCtx) throw new Error('无法创建 alpha map 画布');
+
+            workCtx.imageSmoothingEnabled = true;
+            workCtx.clearRect(0, 0, size, size);
+            workCtx.drawImage(img, 0, 0, size, size);
+            const data = workCtx.getImageData(0, 0, size, size).data;
+            const alpha = new Float32Array(size * size);
+
+            for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+                const maxChannel = Math.max(data[i], data[i + 1], data[i + 2]);
+                alpha[j] = maxChannel / 255;
+            }
+
+            return alpha;
+        }
+
+        function computeSobelMagnitude(source, width, height) {
+            const output = new Float32Array(width * height);
+            if (width < 3 || height < 3) return output;
+
+            for (let y = 1; y < height - 1; y++) {
+                for (let x = 1; x < width - 1; x++) {
+                    const p00 = source[(y - 1) * width + (x - 1)];
+                    const p01 = source[(y - 1) * width + x];
+                    const p02 = source[(y - 1) * width + (x + 1)];
+                    const p10 = source[y * width + (x - 1)];
+                    const p12 = source[y * width + (x + 1)];
+                    const p20 = source[(y + 1) * width + (x - 1)];
+                    const p21 = source[(y + 1) * width + x];
+                    const p22 = source[(y + 1) * width + (x + 1)];
+
+                    const gx = (-p00 + p02) + (-2 * p10 + 2 * p12) + (-p20 + p22);
+                    const gy = (-p00 - 2 * p01 - p02) + (p20 + 2 * p21 + p22);
+                    output[y * width + x] = Math.sqrt(gx * gx + gy * gy);
+                }
+            }
+
+            return output;
+        }
+
+        function computeNccScore(a, b) {
+            if (!a || !b || a.length !== b.length || a.length === 0) return 0;
+
+            let meanA = 0;
+            let meanB = 0;
+            for (let i = 0; i < a.length; i++) {
+                meanA += a[i];
+                meanB += b[i];
+            }
+            meanA /= a.length;
+            meanB /= b.length;
+
+            let num = 0;
+            let denA = 0;
+            let denB = 0;
+            for (let i = 0; i < a.length; i++) {
+                const da = a[i] - meanA;
+                const db = b[i] - meanB;
+                num += da * db;
+                denA += da * da;
+                denB += db * db;
+            }
+
+            const denom = Math.sqrt(denA * denB);
+            if (!Number.isFinite(denom) || denom < 1e-8) return 0;
+            return num / denom;
+        }
+
+        function computeStdDev(data) {
+            if (!data || data.length === 0) return 0;
+            let sum = 0;
+            for (let i = 0; i < data.length; i++) sum += data[i];
+            const mean = sum / data.length;
+            let varSum = 0;
+            for (let i = 0; i < data.length; i++) {
+                const d = data[i] - mean;
+                varSum += d * d;
+            }
+            return Math.sqrt(varSum / data.length);
+        }
+
+        function getNanoWatermarkConfig(width, height) {
+            if (width > 1024 && height > 1024) {
+                return { logoSize: 96, marginRight: 64, marginBottom: 64 };
+            }
+            return { logoSize: 48, marginRight: 32, marginBottom: 32 };
+        }
+
+        function getNanoWatermarkRegion(width, height, config) {
+            const x = width - config.marginRight - config.logoSize;
+            const y = height - config.marginBottom - config.logoSize;
+            return {
+                x,
+                y,
+                w: config.logoSize,
+                h: config.logoSize
+            };
+        }
+
+        function extractGrayRegion(imageData, imageWidth, region) {
+            const out = new Float32Array(region.w * region.h);
+            const src = imageData.data;
+            let writeIdx = 0;
+
+            for (let yy = 0; yy < region.h; yy++) {
+                const y = region.y + yy;
+                for (let xx = 0; xx < region.w; xx++) {
+                    const x = region.x + xx;
+                    const idx = (y * imageWidth + x) * 4;
+                    const gray = (
+                        src[idx] * 0.299 +
+                        src[idx + 1] * 0.587 +
+                        src[idx + 2] * 0.114
+                    ) / 255;
+                    out[writeIdx++] = gray;
+                }
+            }
+
+            return out;
+        }
+
+        function detectNanoWatermarkConfidence(imageData, alphaMapInfo, region) {
+            const imageW = imageData.width;
+            const imageH = imageData.height;
+
+            if (region.x < 0 || region.y < 0 || region.x + region.w > imageW || region.y + region.h > imageH) {
+                return {
+                    detected: false,
+                    confidence: 0,
+                    spatial: 0,
+                    gradient: 0,
+                    variance: 0,
+                    reason: 'region-out-of-bounds'
+                };
+            }
+
+            const wmRegion = extractGrayRegion(imageData, imageW, region);
+            const spatial = computeNccScore(wmRegion, alphaMapInfo.alpha);
+
+            if (spatial < 0.25) {
+                return {
+                    detected: false,
+                    confidence: clamp(spatial * 0.5, 0, 1),
+                    spatial,
+                    gradient: 0,
+                    variance: 0,
+                    reason: 'spatial-low'
+                };
+            }
+
+            const gradRegion = computeSobelMagnitude(wmRegion, region.w, region.h);
+            const gradient = computeNccScore(gradRegion, alphaMapInfo.gradient);
+
+            let varianceScore = 0;
+            const refH = Math.min(region.y, region.h);
+            if (refH > 8) {
+                const refRegion = extractGrayRegion(
+                    imageData,
+                    imageW,
+                    { x: region.x, y: region.y - refH, w: region.w, h: refH }
+                );
+                const stdWm = computeStdDev(wmRegion);
+                const stdRef = computeStdDev(refRegion);
+                if (stdRef > 0.02) {
+                    varianceScore = clamp(1 - (stdWm / stdRef), 0, 1);
+                }
+            }
+
+            const confidence = clamp(
+                (spatial * 0.5) + (gradient * 0.3) + (varianceScore * 0.2),
+                0,
+                1
+            );
+            const detected = confidence >= 0.34 && spatial >= 0.25 && gradient >= -0.04;
+
+            return {
+                detected,
+                confidence,
+                spatial,
+                gradient,
+                variance: varianceScore,
+                reason: detected ? 'ok' : 'confidence-low'
+            };
+        }
+
+        function applyReverseAlphaBlend(imageData, alphaMapInfo, region, logoValue = 255) {
+            const out = new ImageData(
+                new Uint8ClampedArray(imageData.data),
+                imageData.width,
+                imageData.height
+            );
+            const outData = out.data;
+            const alpha = alphaMapInfo.alpha;
+            const alphaThreshold = 0.002;
+            const maxAlpha = 0.99;
+            let activePixels = 0;
+            let clippedChannels = 0;
+            let deltaSum = 0;
+
+            for (let row = 0; row < region.h; row++) {
+                for (let col = 0; col < region.w; col++) {
+                    const mapIdx = row * region.w + col;
+                    let a = alpha[mapIdx];
+                    if (a < alphaThreshold) continue;
+
+                    activePixels++;
+                    a = Math.min(a, maxAlpha);
+                    const oneMinusA = 1 - a;
+                    const imgIdx = ((region.y + row) * out.width + (region.x + col)) * 4;
+
+                    for (let c = 0; c < 3; c++) {
+                        const watermarked = outData[imgIdx + c];
+                        const original = (watermarked - a * logoValue) / oneMinusA;
+                        const restored = clamp(Math.round(original), 0, 255);
+                        if (restored === 0 || restored === 255) clippedChannels++;
+                        deltaSum += Math.abs(restored - watermarked);
+                        outData[imgIdx + c] = restored;
+                    }
+                }
+            }
+
+            const denom = Math.max(1, activePixels * 3);
+            return {
+                imageData: out,
+                stats: {
+                    activePixels,
+                    clipRatio: clippedChannels / denom,
+                    meanDelta: deltaSum / denom
+                }
+            };
+        }
+
+        async function loadNanoAlphaMaps() {
+            if (nanoAlphaMapsCache) return nanoAlphaMapsCache;
+            if (nanoAlphaLoadPromise) return nanoAlphaLoadPromise;
+
+            nanoAlphaLoadPromise = (async () => {
+                for (const url of NANO_ALPHA_SOURCE_URLS) {
+                    try {
+                        const scriptText = await fetchTextWithTimeout(url, 14000);
+                        const bg48 = extractDataUrlFromScript(scriptText, [
+                            'bg_48_default',
+                            'bg48_default',
+                            'bg48DataUrl',
+                            'bg_48_data_url'
+                        ]);
+                        const bg96 = extractDataUrlFromScript(scriptText, [
+                            'bg_96_default',
+                            'bg96_default',
+                            'bg96DataUrl',
+                            'bg_96_data_url'
+                        ]);
+                        if (!bg48 || !bg96) continue;
+
+                        const alpha48 = await buildAlphaMapFromDataUrl(bg48, 48);
+                        const alpha96 = await buildAlphaMapFromDataUrl(bg96, 96);
+                        nanoAlphaMapsCache = {
+                            48: {
+                                alpha: alpha48,
+                                gradient: computeSobelMagnitude(alpha48, 48, 48)
+                            },
+                            96: {
+                                alpha: alpha96,
+                                gradient: computeSobelMagnitude(alpha96, 96, 96)
+                            },
+                            variants: {},
+                            source: url
+                        };
+                        return nanoAlphaMapsCache;
+                    } catch (error) {
+                        console.warn('加载 Nano Banana alpha map 失败：', url, error);
+                    }
+                }
+                return null;
+            })();
+
+            const result = await nanoAlphaLoadPromise;
+            if (!result) {
+                nanoAlphaLoadPromise = null;
+            }
+            return result;
+        }
+
+        function resizeAlphaMapBilinear(source, srcSize, dstSize) {
+            if (dstSize === srcSize) return new Float32Array(source);
+            const out = new Float32Array(dstSize * dstSize);
+            const scale = dstSize > 1 ? (srcSize - 1) / (dstSize - 1) : 0;
+
+            for (let y = 0; y < dstSize; y++) {
+                const sy = y * scale;
+                const y0 = Math.floor(sy);
+                const y1 = Math.min(y0 + 1, srcSize - 1);
+                const wy = sy - y0;
+                for (let x = 0; x < dstSize; x++) {
+                    const sx = x * scale;
+                    const x0 = Math.floor(sx);
+                    const x1 = Math.min(x0 + 1, srcSize - 1);
+                    const wx = sx - x0;
+
+                    const v00 = source[y0 * srcSize + x0];
+                    const v10 = source[y0 * srcSize + x1];
+                    const v01 = source[y1 * srcSize + x0];
+                    const v11 = source[y1 * srcSize + x1];
+                    const top = v00 * (1 - wx) + v10 * wx;
+                    const bottom = v01 * (1 - wx) + v11 * wx;
+                    out[y * dstSize + x] = clamp(top * (1 - wy) + bottom * wy, 0, 1);
+                }
+            }
+
+            return out;
+        }
+
+        function getAlphaVariant(alphaMaps, size) {
+            const key = String(size);
+            if (alphaMaps.variants && alphaMaps.variants[key]) {
+                return alphaMaps.variants[key];
+            }
+
+            const sourceSize = size <= 64 ? 48 : 96;
+            const source = alphaMaps[sourceSize];
+            if (!source) return null;
+            const alpha = resizeAlphaMapBilinear(source.alpha, sourceSize, size);
+            const variant = {
+                alpha,
+                gradient: computeSobelMagnitude(alpha, size, size),
+                size
+            };
+            alphaMaps.variants[key] = variant;
+            return variant;
+        }
+
+        function detectNanoWatermarkAdaptive(imageData, alphaMaps) {
+            const width = imageData.width;
+            const height = imageData.height;
+            const shortEdge = Math.min(width, height);
+            const baseConfig = getNanoWatermarkConfig(width, height);
+            const minSize = Math.max(24, Math.round(shortEdge * 0.045));
+            const maxSize = Math.max(minSize + 2, Math.round(shortEdge * 0.4));
+            const seeds = [baseConfig.logoSize, 48, 96];
+            const scales = [0.72, 0.85, 1, 1.18, 1.36];
+            const sizeList = Array.from(
+                new Set(
+                    seeds
+                        .flatMap(seed => scales.map(scale => Math.round(seed * scale)))
+                        .filter(size => size >= minSize && size <= maxSize)
+                )
+            ).sort((a, b) => a - b);
+            if (sizeList.length === 0) return null;
+
+            let best = null;
+            const marginRatios = [0.45, 2 / 3, 0.82];
+
+            for (const size of sizeList) {
+                const alphaVariant = getAlphaVariant(alphaMaps, size);
+                if (!alphaVariant) continue;
+
+                const radius = Math.max(8, Math.round(size * 0.72));
+                const step = Math.max(2, Math.round(size * 0.12));
+
+                for (const marginRatio of marginRatios) {
+                    const margin = Math.round(size * marginRatio);
+                    const expectedX = width - margin - size;
+                    const expectedY = height - margin - size;
+
+                    for (let oy = -radius; oy <= radius; oy += step) {
+                        for (let ox = -radius; ox <= radius; ox += step) {
+                            if (Math.abs(ox) + Math.abs(oy) > radius * 1.4) continue;
+                            const region = {
+                                x: expectedX + ox,
+                                y: expectedY + oy,
+                                w: size,
+                                h: size
+                            };
+                            if (
+                                region.x < 0 || region.y < 0 ||
+                                region.x + region.w > width ||
+                                region.y + region.h > height
+                            ) {
+                                continue;
+                            }
+
+                            const detection = detectNanoWatermarkConfidence(imageData, alphaVariant, region);
+                            const centerX = region.x + region.w * 0.5;
+                            const centerY = region.y + region.h * 0.5;
+                            const distToCorner = Math.hypot(width - centerX, height - centerY);
+                            const normalizedDist = distToCorner / Math.max(1, Math.max(width, height));
+                            const score = detection.confidence - normalizedDist * 0.04;
+
+                            if (!best || score > best.score) {
+                                best = { detection, region, alphaVariant, score };
+                            }
+                        }
+                    }
+                }
+            }
+
+            return best;
+        }
+
+        async function removeNanoBananaByReverseAlpha(image) {
+            const alphaMaps = await loadNanoAlphaMaps();
+            if (!alphaMaps) {
+                return {
+                    image,
+                    cleaned: false,
+                    method: 'reverse-unavailable',
+                    score: 0,
+                    reason: 'alpha-map-unavailable'
+                };
+            }
+
+            const config = getNanoWatermarkConfig(image.width, image.height);
+            const region = getNanoWatermarkRegion(image.width, image.height, config);
+            const alphaMapInfo = alphaMaps[config.logoSize];
+            if (!alphaMapInfo) {
+                return {
+                    image,
+                    cleaned: false,
+                    method: 'reverse-unavailable',
+                    score: 0,
+                    reason: 'alpha-size-missing'
+                };
+            }
+
+            const workCanvas = document.createElement('canvas');
+            workCanvas.width = image.width;
+            workCanvas.height = image.height;
+            const workCtx = workCanvas.getContext('2d');
+            if (!workCtx) {
+                return {
+                    image,
+                    cleaned: false,
+                    method: 'reverse-unavailable',
+                    score: 0,
+                    reason: 'canvas-context-unavailable'
+                };
+            }
+            workCtx.drawImage(image, 0, 0);
+            const imageData = workCtx.getImageData(0, 0, image.width, image.height);
+            let detection = detectNanoWatermarkConfidence(imageData, alphaMapInfo, region);
+            let useRegion = region;
+            let useAlphaMap = alphaMapInfo;
+            let detectionMode = 'fixed';
+
+            const adaptive = detectNanoWatermarkAdaptive(imageData, alphaMaps);
+            if (adaptive && adaptive.detection.detected) {
+                const adaptiveBetter = adaptive.detection.confidence > detection.confidence + 0.03;
+                if (!detection.detected || adaptiveBetter) {
+                    detection = adaptive.detection;
+                    useRegion = adaptive.region;
+                    useAlphaMap = adaptive.alphaVariant;
+                    detectionMode = 'adaptive';
+                }
+            }
+
+            if (!detection.detected) {
+                return {
+                    image,
+                    cleaned: false,
+                    method: 'reverse-low-confidence',
+                    score: detection.confidence,
+                    rect: useRegion,
+                    metrics: {
+                        ...detection,
+                        mode: detectionMode
+                    },
+                    reason: detection.reason
+                };
+            }
+
+            const restored = applyReverseAlphaBlend(imageData, useAlphaMap, useRegion, 255);
+            const postDetection = detectNanoWatermarkConfidence(restored.imageData, useAlphaMap, useRegion);
+            const confidenceDrop = detection.confidence - postDetection.confidence;
+            const spatialDrop = detection.spatial - postDetection.spatial;
+            const noImprovement =
+                postDetection.confidence >= detection.confidence * 0.92 &&
+                confidenceDrop < 0.045 &&
+                spatialDrop < 0.04;
+            const unstable =
+                restored.stats.clipRatio > 0.26 ||
+                restored.stats.meanDelta > 62 ||
+                noImprovement;
+            if (unstable) {
+                return {
+                    image,
+                    cleaned: false,
+                    method: 'reverse-unstable',
+                    score: detection.confidence,
+                    rect: useRegion,
+                    metrics: {
+                        ...detection,
+                        mode: detectionMode,
+                        postConfidence: postDetection.confidence,
+                        postSpatial: postDetection.spatial,
+                        postGradient: postDetection.gradient,
+                        confidenceDrop,
+                        spatialDrop,
+                        noImprovement,
+                        ...restored.stats
+                    },
+                    reason: noImprovement ? 'reverse-no-improvement' : 'reverse-unstable'
+                };
+            }
+
+            workCtx.putImageData(restored.imageData, 0, 0);
+            const cleanedImage = await createImageFromDataUrl(workCanvas.toDataURL('image/png'));
+            return {
+                image: cleanedImage,
+                cleaned: true,
+                method: 'reverse-alpha',
+                score: detection.confidence,
+                rect: useRegion,
+                metrics: {
+                    ...detection,
+                    mode: detectionMode,
+                    ...restored.stats
+                },
+                source: alphaMaps.source
+            };
         }
 
         function getCornerRegions(width, height) {
@@ -680,20 +1443,17 @@
             return createImageFromDataUrl(workCanvas.toDataURL('image/png'));
         }
 
-        async function removeNanoBananaWatermark(image) {
-            const fallbackRect = fallbackWatermarkRect(image.width, image.height);
+        async function removeNanoBananaByInpaint(image) {
             const cvReady = typeof window.__waitForCv === 'function'
                 ? await window.__waitForCv(9000)
                 : false;
 
             if (!cvReady || !window.cv || typeof window.cv.Mat !== 'function') {
-                const patched = await patchFillFallback(image, fallbackRect);
                 return {
-                    image: patched,
-                    cleaned: true,
-                    method: 'patch-fallback',
-                    score: 0.12,
-                    rect: fallbackRect,
+                    image,
+                    cleaned: false,
+                    method: 'inpaint-unavailable',
+                    score: 0,
                     reason: window.__cvState?.error || 'OpenCV 未就绪'
                 };
             }
@@ -718,16 +1478,26 @@
                 cvLib.cvtColor(srcRgba, gray, cvLib.COLOR_RGBA2GRAY);
 
                 const candidate = locateNanoBananaWatermark(cvLib, gray, image.width, image.height);
-                const isConfident = Number.isFinite(candidate.score) && candidate.score >= 0.33;
-                const maskRect = isConfident
-                    ? expandRect(
-                        candidate,
-                        Math.round(candidate.w * 0.45),
-                        Math.round(candidate.h * 0.7),
-                        image.width,
-                        image.height
-                    )
-                    : fallbackRect;
+                const templateScore = Number.isFinite(candidate.score) ? candidate.score : 0;
+                const strongThreshold = 0.58;
+                if (!candidate.w || !candidate.h || templateScore < strongThreshold) {
+                    return {
+                        image,
+                        cleaned: false,
+                        method: 'inpaint-low-confidence',
+                        score: Math.max(0, templateScore),
+                        rect: fallbackWatermarkRect(image.width, image.height),
+                        reason: 'template-low-confidence'
+                    };
+                }
+
+                const maskRect = expandRect(
+                    candidate,
+                    Math.round(candidate.w * 0.45),
+                    Math.round(candidate.h * 0.7),
+                    image.width,
+                    image.height
+                );
 
                 cvLib.rectangle(
                     mask,
@@ -754,19 +1524,17 @@
                 return {
                     image: cleanedImage,
                     cleaned: true,
-                    method: isConfident ? 'template' : 'fallback',
+                    method: 'inpaint-template',
                     score: Math.max(0, candidate.score || 0),
                     rect: maskRect
                 };
             } catch (error) {
-                console.error('去水印失败，回退到纹理补丁模式：', error);
-                const patched = await patchFillFallback(image, fallbackRect);
+                console.error('inpaint 去水印失败：', error);
                 return {
-                    image: patched,
-                    cleaned: true,
-                    method: 'patch-fallback',
-                    score: 0.1,
-                    rect: fallbackRect,
+                    image,
+                    cleaned: false,
+                    method: 'inpaint-error',
+                    score: 0,
                     reason: error.message || 'OpenCV 去水印异常'
                 };
             } finally {
@@ -779,9 +1547,41 @@
             }
         }
 
+        async function removeNanoBananaWatermark(image) {
+            const reverseResult = await removeNanoBananaByReverseAlpha(image);
+            if (reverseResult.cleaned) {
+                return reverseResult;
+            }
+
+            const inpaintResult = await removeNanoBananaByInpaint(image);
+            if (inpaintResult.cleaned) {
+                inpaintResult.score = Math.max(inpaintResult.score || 0, reverseResult.score || 0);
+                inpaintResult.note = reverseResult.method || '';
+                return inpaintResult;
+            }
+
+            const method = (
+                reverseResult.method === 'reverse-unavailable' &&
+                inpaintResult.method === 'inpaint-unavailable'
+            ) ? 'cleanup-unavailable' : 'no-watermark';
+
+            return {
+                image,
+                cleaned: false,
+                method,
+                score: Math.max(reverseResult.score || 0, inpaintResult.score || 0),
+                reason: `${reverseResult.method || 'reverse-none'}|${inpaintResult.method || 'inpaint-none'}`,
+                details: {
+                    reverse: reverseResult,
+                    inpaint: inpaintResult
+                }
+            };
+        }
+
         async function runCleanupFromSource(loadToken, options = {}) {
             if (!sourceImage) return;
             const manual = !!options.manual;
+            const keepCrop = !!options.keepCrop;
             const jobId = ++cleanupJobId;
             isCleanupRunning = true;
             updateCleanupButtonsState();
@@ -790,12 +1590,34 @@
                 const result = await removeNanoBananaWatermark(sourceImage);
                 if (loadToken !== activeImageLoadToken) return;
 
-                applyImageToEditor(result.image, { keepCrop: false });
+                const currentItem = getCurrentBatchItem();
+                if (currentItem && currentItem.sourceImage === sourceImage) {
+                    currentItem.processedImage = result.image;
+                    currentItem.cleanupMeta = result;
+                }
+
+                applyImageToEditor(result.image, { keepCrop });
                 const confidence = Math.round((result.score || 0) * 100);
-                if (result.method === 'template') {
+                if (result.method === 'reverse-alpha') {
+                    setWatermarkStatus(`已完成去水印（反向 Alpha，置信度 ${confidence}%）`, 'success');
+                } else if (result.method === 'inpaint-template') {
                     setWatermarkStatus(`已完成去水印（模板置信度 ${confidence}%）`, 'success');
-                } else if (result.method === 'fallback') {
-                    setWatermarkStatus('已完成去水印（低置信度，使用右下角修复）', 'warn');
+                } else if (result.method === 'no-watermark') {
+                    setWatermarkStatus('未检测到稳定水印，已保留原图', 'neutral');
+                } else if (result.method === 'reverse-unstable') {
+                    setWatermarkStatus('检测到反向恢复异常，已保留原图', 'warn');
+                } else if (result.method === 'reverse-low-confidence') {
+                    setWatermarkStatus(`低置信度（${confidence}%），已保留原图`, 'neutral');
+                } else if (result.method === 'cleanup-unavailable') {
+                    setWatermarkStatus('去印引擎不可用，已保留原图', 'warn');
+                } else if (result.method === 'inpaint-low-confidence') {
+                    setWatermarkStatus('模板置信度不足，已保留原图', 'neutral');
+                } else if (result.method === 'inpaint-error') {
+                    setWatermarkStatus('inpaint 处理异常，已保留原图', 'warn');
+                } else if (result.method === 'inpaint-unavailable') {
+                    setWatermarkStatus('inpaint 不可用，已保留原图', 'warn');
+                } else if (result.method === 'reverse-unavailable') {
+                    setWatermarkStatus('反向 Alpha 不可用，已保留原图', 'warn');
                 } else if (result.method === 'patch-fallback') {
                     setWatermarkStatus('已完成去水印（OpenCV 不可用，使用纹理覆盖兜底）', 'warn');
                 } else {
@@ -804,7 +1626,12 @@
             } catch (error) {
                 console.error('runCleanupFromSource error:', error);
                 if (loadToken === activeImageLoadToken) {
-                    applyImageToEditor(sourceImage, { keepCrop: false });
+                    const currentItem = getCurrentBatchItem();
+                    if (currentItem && currentItem.sourceImage === sourceImage) {
+                        currentItem.processedImage = currentItem.sourceImage;
+                        currentItem.cleanupMeta = { method: 'original', score: 0 };
+                    }
+                    applyImageToEditor(sourceImage, { keepCrop });
                     setWatermarkStatus('去水印异常，已回退到原图', 'error');
                 }
             } finally {
@@ -816,15 +1643,22 @@
         }
 
         async function rerunWatermarkCleanup() {
-            if (!sourceImage || isCleanupRunning) return;
+            const currentItem = getCurrentBatchItem();
+            if (!currentItem || isCleanupRunning || isBatchGenerating) return;
+            sourceImage = currentItem.sourceImage;
             const loadToken = ++activeImageLoadToken;
-            await runCleanupFromSource(loadToken, { manual: true });
+            await runCleanupFromSource(loadToken, { manual: true, keepCrop: true });
+            updateCleanupButtonsState();
         }
 
         function restoreSourceImage() {
-            if (!sourceImage || isCleanupRunning) return;
+            const currentItem = getCurrentBatchItem();
+            if (!currentItem || isCleanupRunning || isBatchGenerating) return;
             activeImageLoadToken++;
-            applyImageToEditor(sourceImage, { keepCrop: true });
+            sourceImage = currentItem.sourceImage;
+            currentItem.processedImage = currentItem.sourceImage;
+            currentItem.cleanupMeta = { method: 'restored', score: 0 };
+            applyImageToEditor(currentItem.sourceImage, { keepCrop: true });
             setWatermarkStatus('已恢复导入原图', 'neutral');
             updateCleanupButtonsState();
         }
@@ -900,12 +1734,73 @@
             drawCanvas();
         }
 
-        function handleFileSelect(e) {
-            const file = e.target.files[0];
-            if (!file) return;
-            const reader = new FileReader();
-            reader.onload = function(event) { loadImage(event.target.result); };
-            reader.readAsDataURL(file);
+        async function handleFileSelect(e) {
+            const files = Array.from(e.target.files || []).filter(file => !file.type || file.type.startsWith('image/'));
+            fileInput.value = '';
+            if (!files.length) return;
+
+            const loadToken = ++activeImageLoadToken;
+            cleanupJobId++;
+            isBatchGenerating = false;
+            isCleanupRunning = true;
+            resetBatchCollection();
+            updateCleanupButtonsState();
+
+            const shouldAutoCleanup = document.getElementById('autoWatermarkToggle').checked;
+            const importedItems = [];
+            let failed = 0;
+
+            for (let i = 0; i < files.length; i++) {
+                if (loadToken !== activeImageLoadToken) return;
+                const file = files[i];
+                const displayName = file.name || `image_${i + 1}.png`;
+
+                try {
+                    setWatermarkStatus(`正在读取 ${i + 1}/${files.length}: ${displayName}`, 'info');
+                    const dataUrl = await readFileAsDataUrl(file);
+                    const incomingImage = await createImageFromDataUrl(dataUrl);
+
+                    const item = {
+                        name: displayName,
+                        sourceImage: incomingImage,
+                        processedImage: incomingImage,
+                        cleanupMeta: { method: 'original', score: 0 }
+                    };
+
+                    if (shouldAutoCleanup) {
+                        setWatermarkStatus(`正在去水印 ${i + 1}/${files.length}: ${displayName}`, 'info');
+                        const result = await removeNanoBananaWatermark(incomingImage);
+                        if (loadToken !== activeImageLoadToken) return;
+                        item.processedImage = result.image;
+                        item.cleanupMeta = result;
+                    }
+
+                    importedItems.push(item);
+                } catch (error) {
+                    failed++;
+                    console.error(`导入失败（${displayName}）：`, error);
+                }
+            }
+
+            if (loadToken !== activeImageLoadToken) return;
+            batchItems = importedItems;
+            currentBatchIndex = importedItems.length ? 0 : -1;
+            sourceImage = importedItems.length ? importedItems[0].sourceImage : null;
+
+            if (importedItems.length) {
+                switchToBatchItem(0, { keepCrop: false });
+                if (failed > 0) {
+                    setWatermarkStatus(`已导入 ${importedItems.length} 张，失败 ${failed} 张`, 'warn');
+                } else if (!shouldAutoCleanup) {
+                    setWatermarkStatus(`已导入 ${importedItems.length} 张（自动去水印关闭）`, 'neutral');
+                }
+            } else {
+                setWatermarkStatus('未成功导入图片，请重试', 'error');
+                document.getElementById('empty-state').style.display = 'block';
+            }
+
+            isCleanupRunning = false;
+            updateCleanupButtonsState();
         }
 
         function loadDemoImage() {
@@ -925,40 +1820,55 @@
                 dCtx.fillText("Item "+(i+1), i*100+20, 100);
                 dCtx.fillStyle = "#aaa";
             }
-            loadImage(demoCanvas.toDataURL());
+            loadImage(demoCanvas.toDataURL(), 'demo.png');
         }
 
-        function loadImage(src) {
+        async function loadImage(src, fileName = 'image.png') {
             const loadToken = ++activeImageLoadToken;
-            const incomingImage = new Image();
+            cleanupJobId++;
+            isBatchGenerating = false;
+            isCleanupRunning = true;
+            resetBatchCollection();
+            updateCleanupButtonsState();
             setWatermarkStatus('正在读取图片...', 'info');
-
-            incomingImage.onload = async function() {
+            try {
+                const incomingImage = await createImageFromDataUrl(src);
                 if (loadToken !== activeImageLoadToken) return;
-                cleanupJobId++;
-                isCleanupRunning = false;
-                sourceImage = incomingImage;
-                updateCleanupButtonsState();
 
                 const shouldAutoCleanup = document.getElementById('autoWatermarkToggle').checked;
+                const item = {
+                    name: fileName,
+                    sourceImage: incomingImage,
+                    processedImage: incomingImage,
+                    cleanupMeta: { method: 'original', score: 0 }
+                };
+
                 if (shouldAutoCleanup) {
-                    await runCleanupFromSource(loadToken, { manual: false });
-                } else {
-                    applyImageToEditor(sourceImage, { keepCrop: false });
+                    const result = await removeNanoBananaWatermark(incomingImage);
+                    if (loadToken !== activeImageLoadToken) return;
+                    item.processedImage = result.image;
+                    item.cleanupMeta = result;
+                }
+
+                batchItems = [item];
+                currentBatchIndex = 0;
+                sourceImage = item.sourceImage;
+                switchToBatchItem(0, { keepCrop: false });
+
+                if (!shouldAutoCleanup) {
                     setWatermarkStatus('已导入原图（自动去水印关闭）', 'neutral');
                 }
-            };
-
-            incomingImage.onerror = function() {
+            } catch (error) {
                 if (loadToken !== activeImageLoadToken) return;
-                cleanupJobId++;
-                isCleanupRunning = false;
-                sourceImage = null;
-                updateCleanupButtonsState();
+                console.error('图片加载失败：', error);
                 setWatermarkStatus('图片加载失败，请重试', 'error');
-            };
-
-            incomingImage.src = src;
+                document.getElementById('empty-state').style.display = 'block';
+            } finally {
+                if (loadToken === activeImageLoadToken) {
+                    isCleanupRunning = false;
+                    updateCleanupButtonsState();
+                }
+            }
         }
 
         function drawCanvas() {
@@ -1266,9 +2176,59 @@
         // --- 裁切与生成 ---
         let generatedBlobs = []; 
 
+        function canvasToBlob(canvasEl, type = 'image/png') {
+            return new Promise((resolve, reject) => {
+                canvasEl.toBlob(blob => {
+                    if (!blob) {
+                        reject(new Error('生成 Blob 失败'));
+                        return;
+                    }
+                    resolve(blob);
+                }, type);
+            });
+        }
+
+        function resolveCropRectForImage(image, normalizedCrop = null) {
+            const norm = normalizedCrop || getNormalizedCropSnapshot();
+            const imgW = Math.max(1, image.width);
+            const imgH = Math.max(1, image.height);
+
+            let x = Math.round(norm.x * imgW);
+            let y = Math.round(norm.y * imgH);
+            x = clamp(x, 0, Math.max(0, imgW - 1));
+            y = clamp(y, 0, Math.max(0, imgH - 1));
+
+            let w = Math.round(norm.w * imgW);
+            let h = Math.round(norm.h * imgH);
+            w = clamp(w, 1, imgW - x);
+            h = clamp(h, 1, imgH - y);
+
+            return { x, y, w, h };
+        }
+
+        async function ensureItemRenderImage(item, index, total) {
+            const shouldAutoCleanup = document.getElementById('autoWatermarkToggle').checked;
+            const canAutoRun = shouldAutoCleanup && item?.sourceImage && (!item.cleanupMeta || item.cleanupMeta.method === 'original');
+            if (canAutoRun) {
+                setWatermarkStatus(`批量去水印 ${index + 1}/${total}: ${item.name}`, 'info');
+                const result = await removeNanoBananaWatermark(item.sourceImage);
+                item.processedImage = result.image;
+                item.cleanupMeta = result;
+                if (index === currentBatchIndex) {
+                    sourceImage = item.sourceImage;
+                    applyImageToEditor(item.processedImage, { keepCrop: true });
+                }
+            }
+            return item?.processedImage || item?.sourceImage || null;
+        }
+
         async function generateSlices() {
             if (!originalImage) {
                 alert("请先上传图片！");
+                return;
+            }
+            if (isCleanupRunning || isBatchGenerating) {
+                alert("当前有处理中任务，请稍后再试。");
                 return;
             }
 
@@ -1278,36 +2238,40 @@
             const resultPanel = document.getElementById('result-panel');
             const countDisplay = document.getElementById('count-display');
             const prefix = document.getElementById('prefixInput').value || 'slice';
+            const currentItem = getCurrentBatchItem();
+            const stem = currentItem ? getSafeStem(currentItem.name, 'image') : 'image';
+            const withStem = batchItems.length > 1;
 
             gallery.innerHTML = ''; 
             generatedBlobs = [];
             resultPanel.style.height = '300px'; 
             countDisplay.innerText = rows * cols;
 
-            const cellW = cropState.w / cols;
-            const cellH = cropState.h / rows;
+            const cropRect = resolveCropRectForImage(originalImage);
+            const cellW = cropRect.w / cols;
+            const cellH = cropRect.h / rows;
 
             for (let r = 0; r < rows; r++) {
                 for (let c = 0; c < cols; c++) {
                     const tCanvas = document.createElement('canvas');
-                    tCanvas.width = cellW;
-                    tCanvas.height = cellH;
+                    const outW = Math.max(1, Math.round(cellW));
+                    const outH = Math.max(1, Math.round(cellH));
+                    tCanvas.width = outW;
+                    tCanvas.height = outH;
                     const tCtx = tCanvas.getContext('2d');
 
                     tCtx.drawImage(
                         originalImage,
-                        cropState.x + c * cellW, 
-                        cropState.y + r * cellH, 
+                        cropRect.x + c * cellW,
+                        cropRect.y + r * cellH,
                         cellW, cellH,            
-                        0, 0, cellW, cellH       
+                        0, 0, outW, outH
                     );
 
                     const dataUrl = tCanvas.toDataURL('image/png');
-                    const fileName = `${prefix}_${r}_${c}.png`;
-
-                    tCanvas.toBlob(blob => {
-                        generatedBlobs.push({ name: fileName, blob: blob });
-                    }, 'image/png');
+                    const fileName = withStem ? `${prefix}_${stem}_${r}_${c}.png` : `${prefix}_${r}_${c}.png`;
+                    const blob = await canvasToBlob(tCanvas, 'image/png');
+                    generatedBlobs.push({ name: fileName, blob });
 
                     const div = document.createElement('div');
                     div.className = 'result-item';
@@ -1330,6 +2294,85 @@
                 }
             }
             setTimeout(() => { document.getElementById('result-panel').scrollIntoView({behavior: 'smooth'}); }, 300);
+            setWatermarkStatus(`已生成当前图片裁切预览（${rows * cols} 张）`, 'success');
+        }
+
+        async function generateBatchSlicesZip() {
+            if (batchItems.length === 0) {
+                alert("请先导入图片！");
+                return;
+            }
+            if (isCleanupRunning || isBatchGenerating) {
+                alert("当前有处理中任务，请稍后再试。");
+                return;
+            }
+
+            const rows = parseInt(document.getElementById('rowsInput').value) || 1;
+            const cols = parseInt(document.getElementById('colsInput').value) || 1;
+            const prefix = document.getElementById('prefixInput').value || 'slice';
+            const normalizedCrop = getNormalizedCropSnapshot();
+            const zip = new JSZip();
+            const stemCounter = new Map();
+            let outputCount = 0;
+
+            isBatchGenerating = true;
+            updateCleanupButtonsState();
+
+            try {
+                for (let i = 0; i < batchItems.length; i++) {
+                    const item = batchItems[i];
+                    const image = await ensureItemRenderImage(item, i, batchItems.length);
+                    if (!image) continue;
+
+                    const rawStem = getSafeStem(item.name, `image_${i + 1}`);
+                    const used = (stemCounter.get(rawStem) || 0) + 1;
+                    stemCounter.set(rawStem, used);
+                    const stem = used === 1 ? rawStem : `${rawStem}_${used}`;
+
+                    setWatermarkStatus(`批量裁切 ${i + 1}/${batchItems.length}: ${item.name}`, 'info');
+                    const cropRect = resolveCropRectForImage(image, normalizedCrop);
+                    const cellW = cropRect.w / cols;
+                    const cellH = cropRect.h / rows;
+
+                    for (let r = 0; r < rows; r++) {
+                        for (let c = 0; c < cols; c++) {
+                            const tCanvas = document.createElement('canvas');
+                            const outW = Math.max(1, Math.round(cellW));
+                            const outH = Math.max(1, Math.round(cellH));
+                            tCanvas.width = outW;
+                            tCanvas.height = outH;
+                            const tCtx = tCanvas.getContext('2d');
+
+                            tCtx.drawImage(
+                                image,
+                                cropRect.x + c * cellW,
+                                cropRect.y + r * cellH,
+                                cellW,
+                                cellH,
+                                0,
+                                0,
+                                outW,
+                                outH
+                            );
+
+                            const blob = await canvasToBlob(tCanvas, 'image/png');
+                            zip.file(`${prefix}_${stem}_${r}_${c}.png`, blob);
+                            outputCount++;
+                        }
+                    }
+                }
+
+                setWatermarkStatus('正在打包 ZIP...', 'info');
+                const content = await zip.generateAsync({ type: "blob" });
+                saveAs(content, `${prefix}_batch.zip`);
+                setWatermarkStatus(`批量完成：${batchItems.length} 张图片，输出 ${outputCount} 个切片`, 'success');
+            } catch (error) {
+                console.error('批量裁切失败：', error);
+                setWatermarkStatus('批量裁切失败，请重试', 'error');
+            } finally {
+                isBatchGenerating = false;
+                updateCleanupButtonsState();
+            }
         }
 
         function downloadZip() {
